@@ -45,7 +45,7 @@ public class AgentLifecycleService {
         prompt: 你是一个乐于助人的助手。
       provider:
         name: {provider}
-        model: 请在此填写模型名
+        model: {model}
       tools:
         - read_file
         - shell
@@ -285,13 +285,17 @@ public class AgentLifecycleService {
     String desc = description == null || description.isBlank() ? "描述这个 Agent 做什么" : description;
     String provider =
         defaultProvider == null || defaultProvider.isBlank() ? "deepseek" : defaultProvider;
+    // model 用 authorModel（oryxos.author.model）填上，让「创建」出来的 Agent 立即可跑；
+    // 没配 authorModel 才留占位提示，提醒手填。避免脚手架写死中文占位符 → 调用时当模型名发给 LLM 触发 400。
+    String model = authorModel == null || authorModel.isBlank() ? "请在此填写模型名" : authorModel;
     Map<String, String> files = new LinkedHashMap<>();
     files.put(
         "AGENT.md",
         AGENT_MD_TEMPLATE
             .replace("{name}", name)
             .replace("{description}", desc)
-            .replace("{provider}", provider));
+            .replace("{provider}", provider)
+            .replace("{model}", model));
     files.put("scripts/example.py", SCRIPT_TEMPLATE);
     files.put("skills/example.md", SKILL_TEMPLATE);
     files.put("REFERENCE.md", REFERENCE_TEMPLATE);
