@@ -24,6 +24,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Long-lived PRs fail OWASP when main adds CVE suppressions they have not merged.
+  # Fail fast if those files lag the PR base; other drift is still the author's call.
+  owasp-baseline:
+    name: OWASP baseline vs main
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Compare suppressions and root POM to base
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.base_ref }}"
+          base="origin/${{ github.base_ref }}"
+          if git merge-base --is-ancestor "$base" HEAD; then
+            echo "Branch already contains $base."
+            exit 0
+          fi
+          echo "Branch is $(git rev-list --count HEAD.."$base") commit(s) behind $base."
+          changed=0
+          for f in config/dependency-check-suppressions.xml pom.xml; do
+            if ! git diff --quiet "$base" -- "$f"; then
+              echo "::error file=$f::$f differs from ${{ github.base_ref }}. Merge main so OWASP suppressions stay in sync."
+              git --no-pager diff --stat "$base" -- "$f"
+              changed=1
+            fi
+          done
+          if [ "$changed" -ne 0 ]; then
+            echo "Run: make sync-upstream && mvn -B verify"
+            exit 1
+          fi
+          echo "Behind main, but OWASP/pom baseline files match."
+
   build:
     name: Build & quality gate
     runs-on: ubuntu-latest
@@ -99,3 +134,63 @@ jobs:
           -Dspotbugs.skip=true
       - name: docker build
         run: docker build -t oryxos:ci .
+
+  integration-tests:
+    name: Integration tests (*IT, embedded PG)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # #453：boot 模块的 *IT（双副本恰好一次 / 文件面可见性 / 故障接管 / 迁移演进等，zonky 嵌入式 PG）
+      # 不在 surefire 默认 include，此前从不进门禁——曾漏检两处基线失败（039 落卷有案）。
+      # 本 job 显式纳管；@Tag("integration")（真 key / 外部实例 / 重复整机）维持排除，
+      # LiveApiIT 探活失败自动跳过。独立 job 不拖慢本地 mvn verify。
+      - name: install modules (skip tests & quality)
+        run: >-
+          mvn -B clean install -DskipTests
+          -Dspotless.check.skip=true -Dcheckstyle.skip=true
+          -Dpmd.skip=true -Dspotbugs.skip=true
+      - name: run boot *IT
+        run: >-
+          mvn -B -pl oryxos-boot test -Dtest='*IT'
+          -DexcludedGroups=integration
+          -Dsurefire.failIfNoSpecifiedTests=false
+          -Dspotless.check.skip=true -Dcheckstyle.skip=true
+          -Dpmd.skip=true -Dspotbugs.skip=true
+
+  helm:
+    name: Helm chart lint + kind install smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      # 039 门禁档：lint + template + kubeconform + 结构断言（无集群面）
+      - name: install helm & kubeconform
+        run: bash scripts/install-k8s-tools.sh gate
+      - name: helm verify (lint/template/schema/assertions)
+        run: bash scripts/helm-verify.sh
+      # 039 门禁档（analyze C1）：CI runner 自带 docker——kind 安装冒烟属可自动化面。
+      # 构建镜像 → kind load → 附带 PG → helm install → 双副本就绪 + 实例双活断言（SC-001 自动化）
+      - name: package jar
+        run: >-
+          mvn -B clean package -DskipTests
+          -Dspotless.check.skip=true -Dcheckstyle.skip=true
+          -Dpmd.skip=true -Dspotbugs.skip=true
+      - name: docker build
+        run: docker build --build-arg JAR_FILE=oryxos-boot/target/oryxos-boot-*.jar -t oryxos:ci .
+      - name: create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: oryxos-ci
+      - name: kind install smoke
+        run: bash scripts/kind-smoke.sh oryxos:ci

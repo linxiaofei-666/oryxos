@@ -40,6 +40,7 @@ public class AgentScheduler {
   private final SessionManager sessionManager;
   private final ScheduledTaskStore taskStore;
   private final AgentExecutionStore agentExecutionStore;
+  private final AgentExecutionService agentExecutionService;
 
   /** scheduleId => in-process overlap lock. */
   private final ConcurrentMap<String, Lock> taskLocks = new ConcurrentHashMap<>();
@@ -66,12 +67,49 @@ public class AgentScheduler {
       SessionManager sessionManager,
       ScheduledTaskStore taskStore,
       AgentExecutionStore agentExecutionStore) {
+    this(
+        taskScheduler,
+        profileRegistry,
+        agentService,
+        sessionManager,
+        taskStore,
+        agentExecutionStore,
+        null);
+  }
+
+  public AgentScheduler(
+      TaskScheduler taskScheduler,
+      ProfileRegistry profileRegistry,
+      AgentService agentService,
+      SessionManager sessionManager,
+      ScheduledTaskStore taskStore,
+      AgentExecutionStore agentExecutionStore,
+      AgentExecutionService agentExecutionService) {
     this.taskScheduler = taskScheduler;
     this.profileRegistry = profileRegistry;
     this.agentService = agentService;
     this.sessionManager = sessionManager;
     this.taskStore = taskStore;
     this.agentExecutionStore = agentExecutionStore;
+    this.agentExecutionService = agentExecutionService;
+  }
+
+  /** 026 到点认领（可选注入；未注入 = 单机档现状零协调写）。 */
+  private volatile io.oryxos.core.cluster.CoordinationStore coordinationStore;
+
+  private volatile String claimOwner;
+
+  private volatile io.oryxos.core.metrics.MetricsRecorder metricsRecorder =
+      io.oryxos.core.metrics.MetricsRecorder.NOOP;
+
+  public void enableFireTimeClaim(io.oryxos.core.cluster.CoordinationStore store, String owner) {
+    this.coordinationStore = store;
+    this.claimOwner = owner;
+  }
+
+  public void setMetricsRecorder(io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
+    this.metricsRecorder =
+        metricsRecorder == null ? io.oryxos.core.metrics.MetricsRecorder.NOOP : metricsRecorder;
   }
 
   /** Registers schedules for every currently loaded Agent. */
@@ -92,7 +130,10 @@ public class AgentScheduler {
   public void registerProfile(Profile profile) {
     for (ScheduleConfig schedule : profile.schedules()) {
       try {
-        CronTrigger trigger = new CronTrigger(schedule.cron(), resolveZone(schedule.zone()));
+        // 026 A1：包装 Trigger 记录理论触发时刻（scheduled execution time）——各副本对同一 cron
+        // 必然算出同值，作为到点认领的 CAS 值；绝不能用执行时墙钟（各副本不同值会双发）
+        FireTimeTrigger trigger =
+            new FireTimeTrigger(new CronTrigger(schedule.cron(), resolveZone(schedule.zone())));
         String scheduleId =
             taskStore.reconcile(
                 profile.name(),
@@ -108,7 +149,8 @@ public class AgentScheduler {
           long generation = nextGeneration(scheduleId);
           ScheduledFuture<?> future =
               taskScheduler.schedule(
-                  () -> runOnce(profile, schedule, scheduleId, generation), trigger);
+                  () -> runOnce(profile, schedule, scheduleId, generation, trigger.lastScheduled()),
+                  trigger);
           if (future != null) {
             ScheduledFuture<?> previous = scheduledTasks.put(scheduleId, future);
             if (previous != null && previous != future) {
@@ -159,9 +201,9 @@ public class AgentScheduler {
     }
   }
 
-  /** Runs a cron callback if its runtime task is enabled. */
+  /** Runs a cron callback if its runtime task is enabled（fireTime=null：不参与到点认领）。 */
   public void runOnce(Profile profile, ScheduleConfig schedule, String scheduleId) {
-    runOnce(profile, schedule, scheduleId, currentGeneration(scheduleId));
+    runOnce(profile, schedule, scheduleId, currentGeneration(scheduleId), null);
   }
 
   /**
@@ -226,7 +268,11 @@ public class AgentScheduler {
       value = "CRLF_INJECTION_LOGS",
       justification = "The scheduleId is stripped of CR and LF before logging.")
   private void runOnce(
-      Profile profile, ScheduleConfig schedule, String scheduleId, long capturedGeneration) {
+      Profile profile,
+      ScheduleConfig schedule,
+      String scheduleId,
+      long capturedGeneration,
+      java.time.Instant fireTime) {
     Lock lock = lockFor(scheduleId);
     if (!lock.tryLock()) {
       LOG.info("Schedule {} is still running; skipping this trigger", sanitizeLogValue(scheduleId));
@@ -242,6 +288,16 @@ public class AgentScheduler {
       if (!taskStore.isEnabled(scheduleId)) {
         LOG.info("Schedule {} is disabled; skipping this trigger", sanitizeLogValue(scheduleId));
         return;
+      }
+      // 026 到点认领（恰好一次）：fireTime 为理论触发时刻，条件更新 rowcount==1 才执行；
+      // 认领失败 = 另一副本已认领本次到点，静默跳过。单机档（未注入）保持现状。
+      io.oryxos.core.cluster.CoordinationStore store = coordinationStore;
+      if (store != null && fireTime != null) {
+        if (!store.claimFireTime(scheduleId, fireTime, claimOwner)) {
+          LOG.info("Schedule {} fireTime {} 已被其他副本认领，跳过", sanitizeLogValue(scheduleId), fireTime);
+          return;
+        }
+        metricsRecorder.recordLeaseAcquired("schedule"); // 027 补 026 遗留埋点：到点认领赢者
       }
       executeLocked(profile, schedule, scheduleId);
     } finally {
@@ -281,19 +337,33 @@ public class AgentScheduler {
     String sessionId = null;
     boolean success = false;
     String error = null;
-    long agentExecutionId = startAgentExecution(profile, startedAt);
+    long agentExecutionId = startAgentExecution(profile, startedAt, schedule.message());
+    if (agentExecutionService != null && agentExecutionId >= 0) {
+      agentExecutionService.attachScheduledRun(agentExecutionId, profile.name(), "schedule");
+    }
     try {
+      if (agentExecutionId > 0) {
+        ExecutionContext.set(agentExecutionId); // 026：租约行关联 execution（悬空轮留痕）
+      }
       Session session =
           sessionManager.getOrCreate(SCHEDULER_CHANNEL, SCHEDULER_USER, profile.name());
       sessionId = session.sessionId();
       agentService.process(session, schedule.message());
       success = true;
+    } catch (RunCancelledException exception) {
+      error = exception.getMessage();
+      success = false;
     } catch (Exception exception) {
       error = exception.getMessage();
       LOG.error("Schedule {} failed", sanitizeLogValue(scheduleId), exception);
     } finally {
+      ExecutionContext.clear();
       recordExecution(schedule, scheduleId, sessionId, startedAt, success, error, start);
-      finishAgentExecution(agentExecutionId, sessionId, success, error);
+      if (agentExecutionService != null && agentExecutionId >= 0) {
+        agentExecutionService.completeScheduledRun(agentExecutionId, sessionId, success, error);
+      } else {
+        finishAgentExecution(agentExecutionId, sessionId, success, error);
+      }
     }
   }
 
@@ -331,12 +401,12 @@ public class AgentScheduler {
   @edu.umd.cs.findbugs.annotations.SuppressFBWarnings(
       value = "CRLF_INJECTION_LOGS",
       justification = "The exception message is stripped of CR and LF before logging.")
-  private long startAgentExecution(Profile profile, Instant startedAt) {
+  private long startAgentExecution(Profile profile, Instant startedAt, String inputPreview) {
     if (agentExecutionStore == null) {
       return -1;
     }
     try {
-      return agentExecutionStore.start(profile.name(), "schedule", startedAt);
+      return agentExecutionStore.start(profile.name(), "schedule", startedAt, inputPreview);
     } catch (RuntimeException exception) {
       LOG.warn(
           "Could not create Agent execution record: {}", sanitizeLogValue(exception.getMessage()));
@@ -409,5 +479,30 @@ public class AgentScheduler {
 
   static String sanitizeLogValue(String value) {
     return value == null ? "" : value.replace('\r', '_').replace('\n', '_');
+  }
+
+  /**
+   * 记录理论触发时刻的 Trigger 包装（026 A1）：调度器先调 nextExecution 得到 T 再于 T 时刻执行任务， 任务内经 lastScheduled 读回 T。同一
+   * cron 在各副本算出同一日历时刻——恰好一次的 CAS 值来源。
+   */
+  static final class FireTimeTrigger implements org.springframework.scheduling.Trigger {
+
+    private final CronTrigger delegate;
+    private volatile java.time.Instant lastScheduled;
+
+    FireTimeTrigger(CronTrigger delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public java.time.Instant nextExecution(org.springframework.scheduling.TriggerContext context) {
+      java.time.Instant next = delegate.nextExecution(context);
+      this.lastScheduled = next;
+      return next;
+    }
+
+    java.time.Instant lastScheduled() {
+      return lastScheduled;
+    }
   }
 }

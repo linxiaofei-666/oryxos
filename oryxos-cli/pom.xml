@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.oryxos</groupId>
         <artifactId>oryxos</artifactId>
-        <version>0.1.4-RELEASE</version>
+        <version>0.1.5-RELEASE</version>
     </parent>
 
     <artifactId>oryxos-cli</artifactId>
@@ -74,6 +74,34 @@
         </dependency>
         <dependency>
             <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-qq</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-douyin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin-kf</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin-mp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin-mini</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-alipay</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
             <artifactId>oryxos-provider</artifactId>
         </dependency>
         <dependency>
@@ -133,6 +161,21 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-core</artifactId>
+        </dependency>
+        <!-- 039：OTel trace 导出（OtelSpanRecorder）——契约 SpanRecorder 在 core 零依赖，
+             SDK 只进装配层；endpoint 未配置时不初始化（NOOP 档零开销） -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

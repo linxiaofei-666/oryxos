@@ -391,6 +391,29 @@ provider:
 
 `ConfigLoader` 启动时做必填项和格式校验，缺失或非法时给清晰报错，不静默失败。
 
+多副本部署（026）：`oryxos.cluster.enabled=true`（默认 false=单机档零变化）+ 每副本唯一 `instance-id` + 共享 PostgreSQL。
+正确性由一条 CAS 认领原语保障：session turn 租约（同会话恰好一次、跨副本排队）、调度到点认领（恰好一次，
+fireTime 取 CronTrigger 理论触发时刻绝非墙钟）、事件回执去重（替换进程内 Map）、企微连接属主（永不互踢）、
+instances 心跳（GET /api/v1/instances）。误配组合（cluster + SQLite/markdown 记忆/memory 知识库）启动即拒。
+崩溃轮次标失败不重放，用户重发恢复。
+
+文件面分布式（027）：`.oryxos/` 工作区放共享卷（只依赖读写可见 + rename 原子，不依赖文件锁/inotify，
+支持矩阵见 `docs/SharedVolumeGuide.md`）。变更感知走 `workspace_versions` 版本号总线——管理写路径落盘后
+bump 对应域（agents/skills/personas/knowledge），各副本按 `workspace-poll-interval`（默认 1s）轮询重载，
+集群档不装 WatchService watcher（单机档 watcher 零回归）；全部工作区写入经 `AtomicFiles` 原子改名落盘。
+知识索引重建经 `knowledge_build_claims` CAS 认领恰好一次（冲突 409、崩溃 TTL 后接管），检索恒读
+`knowledge_generations` 已提交代次；导入索引段与重建同认领互斥（排队不丢）。运维直接改盘走
+`POST /api/v1/workspace/refresh` 逃生舱。
+
+容器交付（039）：官方 Helm Chart（`charts/oryxos/`，`docs/K8sDeployGuide.md`）——必填仅两项密文引用
+（数据库三键 + `ORYXOS_MASTER_KEY`，K8s Secret→环境变量走 022 原生面），集群档默认开、工作区 RWX PVC、
+liveness/readiness 探针（readiness 含 db）、RollingUpdate 0/1 + preStop + grace 40s。`server.shutdown=graceful`
+已入 boot 默认（在途请求排空=timeout-per-shutdown-phase）；`ChannelAdminService.stopAll` 停机先释放渠道属主
+租约（接管秒级不等 TTL）。OTel trace 可选导出（`oryxos.otel.endpoint`，不配零开销）：`SpanRecorder` 契约在
+core（MetricsRecorder 同款 NOOP 纪律），turn/llm/tool 三 span 与审计同 traceId 同计时区间事后补记，
+turn 根 spanId = traceId 前 16 hex 确定性父子。门禁：`make helm-lint`（lint/template/kubeconform/断言）+
+ci helm job 的 kind 安装冒烟；mock provider 可 `-Doryxos.mock.latency-ms` 注入固定时延供吞吐压测。
+
 落库凭证（providers.api_key、notify_channels.config 敏感项）经主密钥 AES-GCM 加密存储（022，`enc:v1:` 前缀）：`ORYXOS_MASTER_KEY` 环境变量优先，缺省 `.oryxos/master.key` 首启自动生成；密钥不匹配启动即拒并指路恢复。
 
 ---

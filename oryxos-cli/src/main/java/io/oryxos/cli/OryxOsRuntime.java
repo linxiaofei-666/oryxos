@@ -6,6 +6,9 @@ import io.oryxos.core.agent.AgentExecutionService;
 import io.oryxos.core.agent.AgentExecutionStore;
 import io.oryxos.core.agent.AgentLifecycleService;
 import io.oryxos.core.agent.AgentLoader;
+import io.oryxos.core.agent.AgentRunEventHub;
+import io.oryxos.core.agent.AgentRunEventPublisher;
+import io.oryxos.core.agent.AgentRunEventStore;
 import io.oryxos.core.agent.AgentScheduler;
 import io.oryxos.core.agent.AgentService;
 import io.oryxos.core.agent.AgentStore;
@@ -54,9 +57,15 @@ import io.oryxos.provider.ProvidersProperties;
 import io.oryxos.provider.SpringAiProviderServiceImpl;
 import io.oryxos.provider.ToolSchemaAdapter;
 import io.oryxos.storage.AgentExecutionRepository;
+import io.oryxos.storage.AgentRunEventRepository;
 import io.oryxos.storage.ApiKeyRepository;
 import io.oryxos.storage.ApiKeyService;
+import io.oryxos.storage.AuthEventRecorder;
+import io.oryxos.storage.AuthEventRepository;
+import io.oryxos.storage.IdentityMappingRepository;
+import io.oryxos.storage.IdentityMappingService;
 import io.oryxos.storage.JpaAgentExecutionStore;
+import io.oryxos.storage.JpaAgentRunEventStore;
 import io.oryxos.storage.JpaLlmCallAuditor;
 import io.oryxos.storage.JpaNotifyChannelRegistry;
 import io.oryxos.storage.JpaPricingStore;
@@ -102,6 +111,7 @@ import io.oryxos.tool.notify.MatrixNotifyAdapter;
 import io.oryxos.tool.notify.MattermostNotifyAdapter;
 import io.oryxos.tool.notify.NotifyChannelAdapter;
 import io.oryxos.tool.notify.NotifyPoster;
+import io.oryxos.tool.notify.QqNotifyAdapter;
 import io.oryxos.tool.notify.SlackNotifyAdapter;
 import io.oryxos.tool.notify.TeamsNotifyAdapter;
 import io.oryxos.tool.notify.TelegramNotifyAdapter;
@@ -131,6 +141,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.domain.EntityScan;
@@ -166,9 +177,14 @@ import org.springframework.web.context.WebApplicationContext;
   ShellSandboxProperties.class,
   HttpSandboxProperties.class,
   SmtpSandboxProperties.class,
-  ExecutionBackendProperties.class
+  ExecutionBackendProperties.class,
+  io.oryxos.core.cluster.ClusterProperties.class,
+  OtelProperties.class
 })
 public class OryxOsRuntime {
+
+  private static final org.slf4j.Logger LOG =
+      org.slf4j.LoggerFactory.getLogger(OryxOsRuntime.class);
 
   // 工作区根目录默认 ./.oryxos；可用属性 oryxos.root 覆盖（集成测试指向临时工作区，默认行为不变）。
   // 从 Spring Environment 解析（而非 JVM 静态捕获 System property）：使每个上下文各持自己的根，
@@ -255,16 +271,20 @@ public class OryxOsRuntime {
       ProviderRegistry providerRegistry,
       LlmCallAuditor auditor,
       PricingStore pricingStore,
-      io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
+      io.oryxos.core.metrics.MetricsRecorder metricsRecorder,
+      io.oryxos.core.metrics.SpanRecorder spanRecorder) {
     // 动态解析（31 节）：按名从注册表取参数、经工厂即时建/缓存 ChatModel（宪法 III 显式映射，只是运行时可变）
     ProviderChatModelFactory factory = new ProviderChatModelFactory();
-    return new SpringAiProviderServiceImpl(
-        providerRegistry,
-        def -> factory.buildOne(def.name(), def.apiKey(), def.baseUrl()),
-        new ToolSchemaAdapter(),
-        auditor,
-        pricingStore,
-        metricsRecorder); // 023：LLM 调用/token/切换指标
+    SpringAiProviderServiceImpl service =
+        new SpringAiProviderServiceImpl(
+            providerRegistry,
+            def -> factory.buildOne(def.name(), def.apiKey(), def.baseUrl()),
+            new ToolSchemaAdapter(),
+            auditor,
+            pricingStore,
+            metricsRecorder); // 023：LLM 调用/token/切换指标
+    service.setSpanRecorder(spanRecorder); // 039：LLM span（未配 otel.endpoint 时为 NOOP）
+    return service;
   }
 
   @Bean
@@ -322,8 +342,12 @@ public class OryxOsRuntime {
   /** 025 人格库：只读内置 + 可 CRUD 自定义的统一编排（copy-in 模板库，仍非按名引用的人格市场）。 */
   @Bean
   PersonaService personaService(
-      PersonaPresetCatalog personaPresetCatalog, PersonaStore personaStore) {
-    return new PersonaService(personaPresetCatalog, personaStore);
+      PersonaPresetCatalog personaPresetCatalog,
+      PersonaStore personaStore,
+      io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier) {
+    PersonaService service = new PersonaService(personaPresetCatalog, personaStore);
+    service.setWorkspaceVersionNotifier(workspaceVersionNotifier);
+    return service;
   }
 
   /** 30 节：Agent 生命周期编排。创建脚手架的 AGENT.md 模板里 provider 缺省取最终注册表按名称大小写不敏感的最小项。 */
@@ -342,6 +366,7 @@ public class OryxOsRuntime {
       AgentSkillBindingService skillBindings,
       SkillCatalog skillCatalog,
       io.oryxos.core.knowledge.KnowledgeService knowledgeService,
+      io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier,
       @Value("${oryxos.author.provider:}") String authorProvider,
       @Value("${oryxos.author.model:}") String authorModel) {
     String defaultProvider =
@@ -358,29 +383,102 @@ public class OryxOsRuntime {
     // 30 节：把真实工具清单 + notify 渠道注入作者提示词，让"一句话生成"只用真实能力、可直接运行
     // 31 节：再把已连接 MCP server 目录也喂给它，生成的 AGENT.md 才可能正确带上 mcp_servers
     // 014：再把已有知识库名单（name → description）也喂给它，生成的草稿才可能带出正确的绑定建议（FR-018）
-    return new AgentLifecycleService(
-        agentLoader,
-        profileRegistry,
-        agentScheduler,
-        agentStore,
-        providerService,
-        defaultProvider,
-        genProvider,
-        authorModel,
-        tools,
-        notifyChannelRegistry,
-        mcpServerAdmin,
-        skillRegistry,
-        skillBindings,
-        skillCatalog,
-        () ->
-            knowledgeService.listBases().stream()
-                .collect(
-                    java.util.stream.Collectors.toMap(
-                        io.oryxos.core.knowledge.model.KnowledgeBaseInfo::name,
-                        io.oryxos.core.knowledge.model.KnowledgeBaseInfo::description,
-                        (a, b) -> a,
-                        java.util.LinkedHashMap::new)));
+    AgentLifecycleService service =
+        new AgentLifecycleService(
+            agentLoader,
+            profileRegistry,
+            agentScheduler,
+            agentStore,
+            providerService,
+            defaultProvider,
+            genProvider,
+            authorModel,
+            tools,
+            notifyChannelRegistry,
+            mcpServerAdmin,
+            skillRegistry,
+            skillBindings,
+            skillCatalog,
+            () ->
+                knowledgeService.listBases().stream()
+                    .collect(
+                        java.util.stream.Collectors.toMap(
+                            io.oryxos.core.knowledge.model.KnowledgeBaseInfo::name,
+                            io.oryxos.core.knowledge.model.KnowledgeBaseInfo::description,
+                            (a, b) -> a,
+                            java.util.LinkedHashMap::new)));
+    service.setWorkspaceVersionNotifier(workspaceVersionNotifier);
+    return service;
+  }
+
+  /**
+   * 039：trace span 导出——endpoint 未配置（默认）注入 NOOP：零 SDK 初始化零连接零导出（FR-008）； 配置后 OTLP gRPC 批量导出，traceId
+   * 与 021 审计同源。destroyMethod 自动识别 close（flush + shutdown）。
+   */
+  @Bean
+  io.oryxos.core.metrics.SpanRecorder spanRecorder(OtelProperties otelProperties) {
+    if (!otelProperties.enabled()) {
+      return io.oryxos.core.metrics.SpanRecorder.NOOP;
+    }
+    io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter exporter =
+        io.opentelemetry.exporter.otlp.trace.OtlpGrpcSpanExporter.builder()
+            .setEndpoint(otelProperties.getEndpoint())
+            .build();
+    return new OtelSpanRecorder(
+        io.opentelemetry.sdk.trace.export.BatchSpanProcessor.builder(exporter).build(),
+        otelProperties.getSamplerRatio());
+  }
+
+  /** 027 FR-011：手动刷新工作区——集群档 bump 全域（副本轮询生效）；单机档本地全量重载。 */
+  @Bean
+  io.oryxos.core.cluster.WorkspaceRefreshService workspaceRefreshService(
+      io.oryxos.core.cluster.ClusterProperties clusterProperties,
+      io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier,
+      AgentLifecycleService agentLifecycleService,
+      SkillRegistry skillRegistry,
+      SkillLoader skillLoader,
+      io.oryxos.knowledge.index.KnowledgeIndexService knowledgeIndexService) {
+    Runnable localReload =
+        () -> {
+          agentLifecycleService.reconcileAll();
+          skillRegistry.replaceAll(skillLoader.loadAll().all());
+          java.nio.file.Path knowledgeDir = oryxosRoot().resolve("knowledge");
+          if (java.nio.file.Files.isDirectory(knowledgeDir)) {
+            try (java.util.stream.Stream<java.nio.file.Path> bases =
+                java.nio.file.Files.list(knowledgeDir)) {
+              bases
+                  .filter(java.nio.file.Files::isDirectory)
+                  .sorted()
+                  .forEach(
+                      base -> knowledgeIndexService.reconcile(String.valueOf(base.getFileName())));
+            } catch (java.io.IOException e) {
+              throw new java.io.UncheckedIOException("刷新时扫描知识库目录失败", e);
+            }
+          }
+        };
+    return new io.oryxos.core.cluster.WorkspaceRefreshService(
+        clusterProperties.isEnabled(), workspaceVersionNotifier, localReload);
+  }
+
+  /** 027：工作区版本总线的写端——集群档递增对应域版本号（自吞异常不影响写路径主链路），单机档 NOOP 零写入。 */
+  @Bean
+  io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier(
+      io.oryxos.core.cluster.ClusterProperties clusterProperties,
+      io.oryxos.core.cluster.CoordinationStore coordinationStore) {
+    if (!clusterProperties.isEnabled()) {
+      return io.oryxos.core.cluster.WorkspaceVersionNotifier.NOOP;
+    }
+    String owner = clusterProperties.owner();
+    org.slf4j.Logger notifierLog =
+        org.slf4j.LoggerFactory.getLogger(io.oryxos.core.cluster.WorkspaceVersionNotifier.class);
+    return domain -> {
+      try {
+        coordinationStore.bumpWorkspaceVersion(domain, owner);
+      } catch (RuntimeException e) {
+        // 静态消息 + throwable：不拼动态串（CRLF 纪律）；domain 见异常堆栈上下文
+        notifierLog.warn("工作区版本号递增失败（其他副本感知将延迟到下次变更/手动刷新）", e);
+      }
+    };
   }
 
   /** 30 节 WorkspaceWatcher 专用守护线程执行器（跟 25 节调度线程池同类，不手工 new Thread）。 */
@@ -402,20 +500,60 @@ public class OryxOsRuntime {
    */
   @Bean
   ApplicationListener<ContextClosedEvent> watcherGracefulShutdown(
-      WorkspaceWatcher workspaceWatcher,
-      io.oryxos.knowledge.watch.KnowledgeWatcher knowledgeWatcher) {
+      org.springframework.beans.factory.ObjectProvider<WorkspaceWatcher> workspaceWatcher,
+      org.springframework.beans.factory.ObjectProvider<io.oryxos.knowledge.watch.KnowledgeWatcher>
+          knowledgeWatcher,
+      org.springframework.beans.factory.ObjectProvider<
+              io.oryxos.core.cluster.WorkspaceVersionPoller>
+          workspaceVersionPoller) {
     return event -> {
-      workspaceWatcher.stop();
-      knowledgeWatcher.stop();
+      workspaceWatcher.ifAvailable(WorkspaceWatcher::stop);
+      knowledgeWatcher.ifAvailable(io.oryxos.knowledge.watch.KnowledgeWatcher::stop);
+      workspaceVersionPoller.ifAvailable(io.oryxos.core.cluster.WorkspaceVersionPoller::stop);
     };
   }
 
-  /** 30 节：实时监听 .oryxos/agents/——守护线程上跑监听循环，启动后的变更走同一段 register。 */
+  /**
+   * 30 节：实时监听 .oryxos/agents/——守护线程上跑监听循环，启动后的变更走同一段 register。027：集群档不装配（NFS 上 inotify
+   * 不可靠，改走版本号轮询）。
+   */
   @Bean(initMethod = "start")
+  @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
+      name = "oryxos.cluster.enabled",
+      havingValue = "false",
+      matchIfMissing = true)
   WorkspaceWatcher workspaceWatcher(
       AgentLifecycleService agentLifecycleService,
       ThreadPoolTaskExecutor workspaceWatcherExecutor) {
     return new WorkspaceWatcher(agentLifecycleService, oryxosRoot(), workspaceWatcherExecutor);
+  }
+
+  /**
+   * 027：集群档文件面变更感知——「DB 作通知总线、文件作内容载体」的消费端：agents 域全量对账、 skills 域整体重扫替换、personas 域按需读盘无注册表（no-op）、
+   * knowledge 域失效代次缓存。 单机档不装配（watcher 原样，FR-003/FR-010）。
+   */
+  @Bean(initMethod = "start")
+  @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
+      name = "oryxos.cluster.enabled",
+      havingValue = "true")
+  io.oryxos.core.cluster.WorkspaceVersionPoller workspaceVersionPoller(
+      io.oryxos.core.cluster.CoordinationStore coordinationStore,
+      io.oryxos.core.cluster.ClusterProperties clusterProperties,
+      ThreadPoolTaskScheduler taskScheduler,
+      AgentLifecycleService agentLifecycleService,
+      SkillRegistry skillRegistry,
+      SkillLoader skillLoader,
+      io.oryxos.knowledge.index.KnowledgeIndexService knowledgeIndexService,
+      io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
+    io.oryxos.core.cluster.WorkspaceVersionPoller poller =
+        new io.oryxos.core.cluster.WorkspaceVersionPoller(
+            coordinationStore, clusterProperties, taskScheduler);
+    poller.setMetricsRecorder(metricsRecorder);
+    poller.register("agents", agentLifecycleService::reconcileAll);
+    poller.register("skills", () -> skillRegistry.replaceAll(skillLoader.loadAll().all()));
+    poller.register("personas", () -> {}); // 按需读盘域：共享卷可见即生效（R2 裁决）
+    poller.register("knowledge", knowledgeIndexService::invalidateGenerationCache);
+    return poller;
   }
 
   @Bean
@@ -489,22 +627,39 @@ public class OryxOsRuntime {
   io.oryxos.knowledge.index.KnowledgeIndexService knowledgeIndexService(
       io.oryxos.knowledge.store.ChunkStore chunkStore,
       java.util.function.Supplier<io.oryxos.core.embedding.TextEmbedder> textEmbedderSupplier,
-      ExecutorService agentExecutionExecutor) {
+      @Qualifier("agentExecutionExecutor") ExecutorService agentExecutionExecutor,
+      io.oryxos.core.cluster.ClusterProperties clusterProperties,
+      io.oryxos.core.cluster.CoordinationStore coordinationStore,
+      io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
     // 两段式导入的后台段跑在虚拟线程执行器上（宪法 VII：同步代码 + 虚拟线程，无异步编程模型）
-    return new io.oryxos.knowledge.index.KnowledgeIndexService(
-        oryxosRoot().resolve("knowledge"),
-        chunkStore,
-        textEmbedderSupplier,
-        agentExecutionExecutor);
+    io.oryxos.knowledge.index.KnowledgeIndexService service =
+        new io.oryxos.knowledge.index.KnowledgeIndexService(
+            oryxosRoot().resolve("knowledge"),
+            chunkStore,
+            textEmbedderSupplier,
+            agentExecutionExecutor);
+    // 027：集群档启用索引构建 CAS 认领 + 已提交代次；单机档不启用保持现状零协调读写
+    if (clusterProperties.isEnabled()) {
+      service.enableClusterCoordination(coordinationStore, clusterProperties);
+      service.setMetricsRecorder(metricsRecorder);
+    }
+    return service;
   }
 
   @Bean
   io.oryxos.knowledge.LocalKnowledgeBackend localKnowledgeBackend(
       io.oryxos.knowledge.store.ChunkStore chunkStore,
       io.oryxos.knowledge.index.KnowledgeIndexService knowledgeIndexService,
-      java.util.function.Supplier<io.oryxos.core.embedding.TextEmbedder> textEmbedderSupplier) {
-    return new io.oryxos.knowledge.LocalKnowledgeBackend(
-        oryxosRoot().resolve("knowledge"), chunkStore, knowledgeIndexService, textEmbedderSupplier);
+      java.util.function.Supplier<io.oryxos.core.embedding.TextEmbedder> textEmbedderSupplier,
+      io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier) {
+    io.oryxos.knowledge.LocalKnowledgeBackend backend =
+        new io.oryxos.knowledge.LocalKnowledgeBackend(
+            oryxosRoot().resolve("knowledge"),
+            chunkStore,
+            knowledgeIndexService,
+            textEmbedderSupplier);
+    backend.setWorkspaceVersionNotifier(workspaceVersionNotifier);
+    return backend;
   }
 
   @Bean
@@ -528,8 +683,15 @@ public class OryxOsRuntime {
     return executor;
   }
 
-  /** FR-010：实时监听 .oryxos/knowledge/——启动全量对账 + 运行中增改删收敛到索引（US4）。 */
+  /**
+   * FR-010：实时监听 .oryxos/knowledge/——启动全量对账 + 运行中增改删收敛到索引（US4）。 027：集群档不装配（NFS 上 inotify 不可靠；上传经 API
+   * 即时索引，直接改盘走手动刷新入口）。
+   */
   @Bean(initMethod = "start")
+  @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(
+      name = "oryxos.cluster.enabled",
+      havingValue = "false",
+      matchIfMissing = true)
   io.oryxos.knowledge.watch.KnowledgeWatcher knowledgeWatcher(
       io.oryxos.knowledge.index.KnowledgeIndexService knowledgeIndexService,
       ThreadPoolTaskExecutor knowledgeWatcherExecutor) {
@@ -562,8 +724,12 @@ public class OryxOsRuntime {
   }
 
   @Bean
-  AgentSkillBindingService agentSkillBindingService(SkillLoader skillLoader) {
-    return new AgentSkillBindingService(oryxosRoot(), skillLoader);
+  AgentSkillBindingService agentSkillBindingService(
+      SkillLoader skillLoader,
+      io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier) {
+    AgentSkillBindingService service = new AgentSkillBindingService(oryxosRoot(), skillLoader);
+    service.setWorkspaceVersionNotifier(workspaceVersionNotifier);
+    return service;
   }
 
   @Bean
@@ -577,8 +743,10 @@ public class OryxOsRuntime {
       SkillStore skillStore,
       SkillRegistry skillRegistry,
       SkillLoader skillLoader,
-      AgentSkillBindingService skillBindings) {
+      AgentSkillBindingService skillBindings,
+      io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier) {
     SkillService service = new SkillService(skillStore, skillRegistry, skillLoader, skillBindings);
+    service.setWorkspaceVersionNotifier(workspaceVersionNotifier);
     service.seedBuiltins();
     return service;
   }
@@ -681,7 +849,11 @@ public class OryxOsRuntime {
       case "mem0" ->
           new Mem0MemoryStore(
               restClient.mutate().baseUrl(mem0BaseUrl).build(), mem0UserId, mem0ApiKey);
-      default -> new MarkdownMemoryStore(oryxosRoot());
+      case "markdown" -> new MarkdownMemoryStore(oryxosRoot());
+        // 026 顺修：未知值曾静默回落 markdown——配置了却不生效比启动失败更危险（knowledge.store 同口径）
+      default ->
+          throw new IllegalStateException(
+              "未知的 memory.backend: " + backend + "（支持 markdown / sqlite / mem0）");
     };
   }
 
@@ -832,6 +1004,7 @@ public class OryxOsRuntime {
     notifyAdapters.put("gchat", new GoogleChatNotifyAdapter(notifyPoster));
     notifyAdapters.put("mattermost", new MattermostNotifyAdapter(notifyPoster));
     notifyAdapters.put("matrix", new MatrixNotifyAdapter(notifyPoster));
+    notifyAdapters.put("qq", new QqNotifyAdapter(notifyPoster));
     registry.register(new NotifyTools(notifyAdapters, sandbox, notifyChannelRegistry));
     // 记忆工具：save_memory / recall_memory（补齐 20 节预留的两工具面），只认门面对后端无感
     registry.registerAnnotated(new MemoryTools(memoryService));
@@ -931,13 +1104,17 @@ public class OryxOsRuntime {
       ToolRegistry toolRegistry,
       ProfileRegistry profileRegistry,
       ToolInvocationAuditor auditor,
+      AgentRunEventPublisher agentRunEventPublisher,
       io.oryxos.core.policy.ToolPolicyService toolPolicyService,
-      io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
+      io.oryxos.core.metrics.MetricsRecorder metricsRecorder,
+      io.oryxos.core.metrics.SpanRecorder spanRecorder) {
     // 31 节：mcp_servers 白名单在此接线。mcpToolOwners() 是活视图，与 tools bean 一样不能在构造时 copyOf。
     ToolExecutor executor =
-        new ToolExecutor(tools, toolRegistry.mcpToolOwners(), profileRegistry, auditor);
+        new ToolExecutor(
+            tools, toolRegistry.mcpToolOwners(), profileRegistry, auditor, agentRunEventPublisher);
     executor.setToolPolicy(toolPolicyService); // 020：事中裁决——防幻觉调用与热更新窗口
     executor.setMetricsRecorder(metricsRecorder); // 023：工具调用/策略拦截指标
+    executor.setSpanRecorder(spanRecorder); // 039：工具 span（未配 otel.endpoint 时为 NOOP）
     return executor;
   }
 
@@ -951,8 +1128,10 @@ public class OryxOsRuntime {
       PromptBuilder promptBuilder,
       ProviderService providerService,
       ToolExecutor toolExecutor,
+      AgentRunEventPublisher agentRunEventPublisher,
       InterruptManager interruptManager) {
-    return new ReActLoop(promptBuilder, providerService, toolExecutor, interruptManager);
+    return new ReActLoop(
+        promptBuilder, providerService, toolExecutor, agentRunEventPublisher, interruptManager);
   }
 
   @Bean
@@ -964,6 +1143,41 @@ public class OryxOsRuntime {
   @Bean
   WebUserService webUserService(WebUserRepository repository, PasswordEncoder passwordEncoder) {
     return new WebUserService(repository, passwordEncoder);
+  }
+
+  /** 039：授权拒绝审计落库（写失败不抛，不影响裁决）。 */
+  @Bean
+  io.oryxos.storage.AuthzEventRecorder authzEventRecorder(
+      io.oryxos.storage.AuthzEventRepository repository) {
+    return new io.oryxos.storage.AuthzEventRecorder(repository);
+  }
+
+  /** 040：认证事件审计（LOGIN_* / LOGOUT / MAPPING_*）。 */
+  @Bean
+  AuthEventRecorder authEventRecorder(AuthEventRepository repository) {
+    return new AuthEventRecorder(repository);
+  }
+
+  /** 041：资产侧车读写，根目录与 AgentStore 同为 {@code oryxos.root}。 */
+  @Bean
+  io.oryxos.core.policy.AssetGovernanceStore assetGovernanceStore() {
+    return new io.oryxos.core.policy.AssetGovernanceStore(oryxosRoot());
+  }
+
+  /** 041：治理侧车变更审计（写失败不回滚已落盘的 YAML）。 */
+  @Bean
+  io.oryxos.storage.AssetGovernanceEventRecorder assetGovernanceEventRecorder(
+      io.oryxos.storage.AssetGovernanceEventRepository repository) {
+    return new io.oryxos.storage.AssetGovernanceEventRecorder(repository);
+  }
+
+  /** 040：OIDC issuer/sub → 本地 username 映射。 */
+  @Bean
+  IdentityMappingService identityMappingService(
+      IdentityMappingRepository repository,
+      WebUserRepository userRepository,
+      AuthEventRecorder authEventRecorder) {
+    return new IdentityMappingService(repository, userRepository, authEventRecorder);
   }
 
   /**
@@ -995,8 +1209,16 @@ public class OryxOsRuntime {
 
   @Bean
   AgentService agentService(
-      ProfileRegistry profileRegistry, ReActLoop reActLoop, SessionManager sessionManager) {
-    return new AgentService(profileRegistry, reActLoop, sessionManager);
+      ProfileRegistry profileRegistry,
+      ReActLoop reActLoop,
+      SessionManager sessionManager,
+      io.oryxos.core.cluster.TurnCoordinator turnCoordinator,
+      io.oryxos.core.metrics.SpanRecorder spanRecorder) {
+    // 026：单机档 NOOP（零协调开销）、集群档 DB 租约——按 oryxos.cluster.enabled 装配
+    AgentService service =
+        new AgentService(profileRegistry, reActLoop, sessionManager, turnCoordinator);
+    service.setSpanRecorder(spanRecorder); // 039：turn 根 span（未配 otel.endpoint 时为 NOOP）
+    return service;
   }
 
   @Bean
@@ -1012,8 +1234,18 @@ public class OryxOsRuntime {
   }
 
   @Bean
-  io.oryxos.core.channel.MessageDeduplicator messageDeduplicator() {
-    return new io.oryxos.core.channel.MessageDeduplicator();
+  io.oryxos.core.channel.MessageDeduplicator messageDeduplicator(
+      io.oryxos.core.cluster.ClusterProperties cluster,
+      io.oryxos.core.cluster.CoordinationStore store,
+      io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
+    // 026：单机档进程内去重（现状）；集群档回执落共享库跨副本判重（两级：本地缓存 + DB 硬闸）
+    if (!cluster.isEnabled()) {
+      return new io.oryxos.core.channel.InMemoryMessageDeduplicator();
+    }
+    io.oryxos.core.channel.SharedReceiptDeduplicator dedup =
+        new io.oryxos.core.channel.SharedReceiptDeduplicator(store);
+    dedup.setMetricsRecorder(metricsRecorder);
+    return dedup;
   }
 
   @Bean
@@ -1061,12 +1293,58 @@ public class OryxOsRuntime {
       io.oryxos.core.channel.InboundChannelRegistry inboundChannelRegistry,
       ProfileRegistry profileRegistry,
       io.oryxos.core.channel.InboundMessageService inboundMessageService,
-      io.oryxos.core.channel.OutboundGuard channelOutboundGuard) {
+      io.oryxos.core.channel.OutboundGuard channelOutboundGuard,
+      io.oryxos.core.cluster.ClusterProperties clusterProps,
+      io.oryxos.core.cluster.CoordinationStore coordinationStore,
+      ThreadPoolTaskScheduler taskScheduler,
+      io.oryxos.core.metrics.MetricsRecorder channelMetricsRecorder) {
+    io.oryxos.core.channel.ChannelAdminService service =
+        new io.oryxos.core.channel.ChannelAdminService(
+            channelConfigLoader,
+            inboundChannelRegistry,
+            profileRegistry,
+            inboundChannelFactories(profileRegistry, inboundMessageService, channelOutboundGuard));
+    // 026：集群档下独连型渠道（企微）走属主协调——持租约副本建连，属主失效自动接管，永不互踢
+    if (clusterProps.isEnabled()) {
+      io.oryxos.core.channel.ChannelLeaseCoordinator leaseCoordinator =
+          new io.oryxos.core.channel.ChannelLeaseCoordinator(
+              coordinationStore, clusterProps, taskScheduler);
+      leaseCoordinator.setMetricsRecorder(channelMetricsRecorder);
+      service.setChannelLeaseCoordinator(leaseCoordinator);
+    }
+    return service;
+  }
+
+  private static Map<
+          String,
+          java.util.function.Function<
+              io.oryxos.core.channel.ChannelConfig, io.oryxos.core.channel.InboundChannelAdapter>>
+      inboundChannelFactories(
+          ProfileRegistry profileRegistry,
+          io.oryxos.core.channel.InboundMessageService inboundMessageService,
+          io.oryxos.core.channel.OutboundGuard channelOutboundGuard) {
     Map<
             String,
             java.util.function.Function<
                 io.oryxos.core.channel.ChannelConfig, io.oryxos.core.channel.InboundChannelAdapter>>
         factories = new LinkedHashMap<>();
+    registerEnterpriseChannelFactories(
+        factories, profileRegistry, inboundMessageService, channelOutboundGuard);
+    registerConsumerChannelFactories(
+        factories, profileRegistry, inboundMessageService, channelOutboundGuard);
+    return factories;
+  }
+
+  private static void registerEnterpriseChannelFactories(
+      Map<
+              String,
+              java.util.function.Function<
+                  io.oryxos.core.channel.ChannelConfig,
+                  io.oryxos.core.channel.InboundChannelAdapter>>
+          factories,
+      ProfileRegistry profileRegistry,
+      io.oryxos.core.channel.InboundMessageService inboundMessageService,
+      io.oryxos.core.channel.OutboundGuard channelOutboundGuard) {
     factories.put(
         io.oryxos.channel.feishu.FeishuChannelAdapter.TYPE,
         resolved ->
@@ -1097,6 +1375,18 @@ public class OryxOsRuntime {
         resolved ->
             new io.oryxos.channel.telegram.TelegramChannelAdapter(
                 resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+  }
+
+  private static void registerConsumerChannelFactories(
+      Map<
+              String,
+              java.util.function.Function<
+                  io.oryxos.core.channel.ChannelConfig,
+                  io.oryxos.core.channel.InboundChannelAdapter>>
+          factories,
+      ProfileRegistry profileRegistry,
+      io.oryxos.core.channel.InboundMessageService inboundMessageService,
+      io.oryxos.core.channel.OutboundGuard channelOutboundGuard) {
     factories.put(
         io.oryxos.channel.whatsapp.WhatsAppChannelAdapter.TYPE,
         resolved ->
@@ -1122,8 +1412,41 @@ public class OryxOsRuntime {
         resolved ->
             new io.oryxos.channel.matrix.MatrixChannelAdapter(
                 resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
-    return new io.oryxos.core.channel.ChannelAdminService(
-        channelConfigLoader, inboundChannelRegistry, profileRegistry, factories);
+    factories.put(
+        io.oryxos.channel.qq.QqChannelAdapter.TYPE,
+        resolved ->
+            new io.oryxos.channel.qq.QqChannelAdapter(
+                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+    factories.put(
+        io.oryxos.channel.douyin.DouyinChannelAdapter.TYPE,
+        resolved ->
+            new io.oryxos.channel.douyin.DouyinChannelAdapter(
+                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+    factories.put(
+        io.oryxos.channel.weixin.WeixinChannelAdapter.TYPE,
+        resolved ->
+            new io.oryxos.channel.weixin.WeixinChannelAdapter(
+                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+    factories.put(
+        io.oryxos.channel.weixinkf.WeixinKfChannelAdapter.TYPE,
+        resolved ->
+            new io.oryxos.channel.weixinkf.WeixinKfChannelAdapter(
+                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+    factories.put(
+        io.oryxos.channel.weixinmp.WeixinMpChannelAdapter.TYPE,
+        resolved ->
+            new io.oryxos.channel.weixinmp.WeixinMpChannelAdapter(
+                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+    factories.put(
+        io.oryxos.channel.weixinmini.WeixinMiniChannelAdapter.TYPE,
+        resolved ->
+            new io.oryxos.channel.weixinmini.WeixinMiniChannelAdapter(
+                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
+    factories.put(
+        io.oryxos.channel.alipay.AlipayChannelAdapter.TYPE,
+        resolved ->
+            new io.oryxos.channel.alipay.AlipayChannelAdapter(
+                resolved, profileRegistry, inboundMessageService, channelOutboundGuard));
   }
 
   /**
@@ -1138,6 +1461,75 @@ public class OryxOsRuntime {
     scheduler.setDaemon(true);
     scheduler.initialize();
     return scheduler;
+  }
+
+  /** 026：协调存储恒建（读操作单机档也可答）；写协调只在 cluster.enabled=true 生效。 */
+  @Bean
+  io.oryxos.core.cluster.CoordinationStore coordinationStore(
+      io.oryxos.storage.TurnLeaseRepository turnLeases,
+      io.oryxos.storage.ChannelEventReceiptRepository receipts,
+      io.oryxos.storage.ChannelLeaseRepository channelLeases,
+      io.oryxos.storage.InstanceHeartbeatRepository instances,
+      io.oryxos.storage.ScheduledTaskRepository scheduledTasks,
+      io.oryxos.storage.WorkspaceVersionRepository workspaceVersions,
+      io.oryxos.storage.KnowledgeBuildClaimRepository buildClaims,
+      io.oryxos.storage.KnowledgeGenerationRepository generations) {
+    return new io.oryxos.storage.JpaCoordinationStore(
+        turnLeases,
+        receipts,
+        channelLeases,
+        instances,
+        scheduledTasks,
+        workspaceVersions,
+        buildClaims,
+        generations);
+  }
+
+  /** 026：轮次互斥——单机档 NOOP（零协调写零变化），集群档 DB 租约（认领「正在执行的一轮」）。 */
+  @Bean
+  io.oryxos.core.cluster.TurnCoordinator turnCoordinator(
+      io.oryxos.core.cluster.ClusterProperties cluster,
+      io.oryxos.core.cluster.CoordinationStore store,
+      ThreadPoolTaskScheduler taskScheduler,
+      AgentExecutionStore agentExecutionStore,
+      io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
+    if (!cluster.isEnabled()) {
+      return io.oryxos.core.cluster.TurnCoordinator.NOOP;
+    }
+    io.oryxos.core.cluster.DbTurnCoordinator coordinator =
+        new io.oryxos.core.cluster.DbTurnCoordinator(store, cluster, taskScheduler);
+    coordinator.setMetricsRecorder(metricsRecorder);
+    // 026：抢过期成功 = 前任副本失联——给其悬空轮补失败留痕（不重放，用户重发恢复）
+    coordinator.setReclaimedExecutionHandler(
+        executionId ->
+            agentExecutionStore.finish(
+                executionId, null, false, "副本失联，轮次终止（租约过期被接管）", java.time.Instant.now()));
+    return coordinator;
+  }
+
+  /** 026：心跳循环（仅集群档）——上报存活 + 惰性清理超龄回执与死实例行。 */
+  @Bean
+  Object clusterHeartbeat(
+      io.oryxos.core.cluster.ClusterProperties cluster,
+      io.oryxos.core.cluster.CoordinationStore store,
+      ThreadPoolTaskScheduler taskScheduler) {
+    if (!cluster.isEnabled()) {
+      return new Object();
+    }
+    long epoch = java.lang.management.ManagementFactory.getRuntimeMXBean().getStartTime();
+    String instanceId = cluster.effectiveInstanceId();
+    java.time.Duration interval = cluster.effectiveHeartbeatInterval();
+    return taskScheduler.scheduleAtFixedRate(
+        () -> {
+          try {
+            store.heartbeat(instanceId, epoch);
+            store.purgeExpired(
+                java.time.Duration.ofHours(12), cluster.getLeaseTtl().multipliedBy(3));
+          } catch (RuntimeException e) {
+            LOG.warn("心跳/清理失败（下一周期重试）", e);
+          }
+        },
+        interval);
   }
 
   /** 28 节：定时任务状态与执行历史落库（重启不丢），并支撑管理台的查看/立即执行/启用停用。 */
@@ -1155,20 +1547,48 @@ public class OryxOsRuntime {
       AgentService agentService,
       SessionManager sessionManager,
       ScheduledTaskStore scheduledTaskStore,
-      AgentExecutionStore agentExecutionStore) {
-    return new AgentScheduler(
-        taskScheduler,
-        profileRegistry,
-        agentService,
-        sessionManager,
-        scheduledTaskStore,
-        agentExecutionStore);
+      AgentExecutionStore agentExecutionStore,
+      AgentExecutionService agentExecutionService,
+      io.oryxos.core.cluster.ClusterProperties clusterProperties,
+      io.oryxos.core.cluster.CoordinationStore coordinationStore,
+      io.oryxos.core.metrics.MetricsRecorder schedulerMetricsRecorder) {
+    AgentScheduler scheduler =
+        new AgentScheduler(
+            taskScheduler,
+            profileRegistry,
+            agentService,
+            sessionManager,
+            scheduledTaskStore,
+            agentExecutionStore,
+            agentExecutionService);
+    // 026：集群档启用到点认领（恰好一次）；单机档不注入保持现状零协调写
+    if (clusterProperties.isEnabled()) {
+      scheduler.enableFireTimeClaim(coordinationStore, clusterProperties.owner());
+      scheduler.setMetricsRecorder(schedulerMetricsRecorder); // 027 补 026 遗留埋点
+    }
+    return scheduler;
   }
 
   /** 32 节：Agent 执行历史落 SQLite（手动触发 + 定时触发都记，起止时间 / 状态）。 */
   @Bean
   AgentExecutionStore agentExecutionStore(AgentExecutionRepository repository) {
     return new JpaAgentExecutionStore(repository);
+  }
+
+  @Bean
+  AgentRunEventStore agentRunEventStore(AgentRunEventRepository repository) {
+    return new JpaAgentRunEventStore(repository);
+  }
+
+  @Bean
+  AgentRunEventHub agentRunEventHub() {
+    return new AgentRunEventHub();
+  }
+
+  @Bean
+  AgentRunEventPublisher agentRunEventPublisher(
+      AgentRunEventStore agentRunEventStore, AgentRunEventHub agentRunEventHub) {
+    return new AgentRunEventPublisher(agentRunEventStore, agentRunEventHub, Clock.systemUTC());
   }
 
   /** 32 节：异步触发的后台执行器——虚拟线程（宪法 VII：虚拟线程处理并发，非 Reactor/WebFlux）。 */
@@ -1178,10 +1598,22 @@ public class OryxOsRuntime {
     return Executors.newVirtualThreadPerTaskExecutor();
   }
 
-  @Bean
+  /** Run 工作台 SSE 推流：与 ReAct worker 隔离，避免互相饿死。 */
+  @Bean(destroyMethod = "shutdown")
+  @SuppressWarnings("PMD.ThreadPoolCreationRule")
+  ExecutorService agentRunStreamExecutor() {
+    return Executors.newVirtualThreadPerTaskExecutor();
+  }
+
+  @Bean(initMethod = "reconcileOnStartup")
   AgentExecutionService agentExecutionService(
-      AgentExecutionStore agentExecutionStore, ExecutorService agentExecutionExecutor) {
+      AgentExecutionStore agentExecutionStore,
+      @Qualifier("agentExecutionExecutor") ExecutorService agentExecutionExecutor,
+      AgentRunEventPublisher agentRunEventPublisher) {
     return new AgentExecutionService(
-        agentExecutionStore, agentExecutionExecutor, Clock.systemDefaultZone());
+        agentExecutionStore,
+        agentExecutionExecutor,
+        Clock.systemDefaultZone(),
+        agentRunEventPublisher);
   }
 }

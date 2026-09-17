@@ -10,6 +10,7 @@ import io.oryxos.web.error.ProviderUnavailableException;
 import io.oryxos.web.error.ResourceNotFoundException;
 import io.oryxos.web.error.ScheduleKeyAmbiguityException;
 import io.oryxos.web.error.SessionNotFoundException;
+import io.oryxos.web.security.AssetGovernanceAccessException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -77,6 +78,16 @@ public class GlobalExceptionHandler {
         .body(ApiResponse.error(HttpStatus.NOT_FOUND.value(), ex.getMessage()));
   }
 
+  /** 403 — 资产治理或授权决策拒绝（041）。理由来自 {@code AuthorizationService.decide}，不另写权限矩阵。 */
+  @ExceptionHandler(AssetGovernanceAccessException.class)
+  public ResponseEntity<ApiResponse<Void>> handleAssetGovernanceDenied(
+      AssetGovernanceAccessException ex) {
+    LOG.warn("Asset governance denied: {}", sanitize(ex.getMessage()));
+    return ResponseEntity.status(HttpStatus.FORBIDDEN)
+        .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+        .body(ApiResponse.error(HttpStatus.FORBIDDEN.value(), ex.getMessage()));
+  }
+
   /** 503 — a downstream dependency (provider, tool, storage) is unavailable. */
   @ExceptionHandler({IllegalStateException.class, ProviderUnavailableException.class})
   public ResponseEntity<ApiResponse<Void>> handleUnavailable(RuntimeException ex) {
@@ -106,6 +117,23 @@ public class GlobalExceptionHandler {
         SkillReferenceConflictView.from(ex.skillName(), ex.references());
     return ResponseEntity.status(HttpStatus.CONFLICT)
         .body(new ApiResponse<>(HttpStatus.CONFLICT.value(), ex.getMessage(), data));
+  }
+
+  /** 429 — 同会话跨副本排队等待超限（026）：前一条消息处理超长，请稍候重发。 */
+  /** 409 — 027：索引重建已由其他副本执行中（恰好一次，不重复构建）。 */
+  @ExceptionHandler(io.oryxos.core.knowledge.KnowledgeBuildInProgressException.class)
+  public ResponseEntity<ApiResponse<Void>> handleKnowledgeBuildInProgress(
+      io.oryxos.core.knowledge.KnowledgeBuildInProgressException ex) {
+    return ResponseEntity.status(HttpStatus.CONFLICT)
+        .body(ApiResponse.error(HttpStatus.CONFLICT.value(), ex.getMessage()));
+  }
+
+  @ExceptionHandler(io.oryxos.core.cluster.TurnWaitTimeoutException.class)
+  public ResponseEntity<ApiResponse<Void>> handleTurnWaitTimeout(
+      io.oryxos.core.cluster.TurnWaitTimeoutException ex) {
+    LOG.warn("Turn wait timeout: {}", sanitize(ex.getMessage()));
+    return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+        .body(ApiResponse.error(HttpStatus.TOO_MANY_REQUESTS.value(), ex.getMessage()));
   }
 
   /** 409 — 会话在执行期间已被另一请求更新，拒绝旧快照覆盖新历史。 */

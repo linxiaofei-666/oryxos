@@ -30,10 +30,21 @@ spring:
         journal_mode: WAL        # 允许读写并发，避免默认 rollback journal 放大锁竞争
         busy_timeout: 5000       # 短暂写锁时最多等待 5 秒，而不是立即报 database is locked
     # ↑ SQLite 专属两项在 PG 下自动失效，无需删除。
-    # PostgreSQL 部署选项（多副本 / 高并发写；PG 14+）——取消注释并按企业库填写：
+    # PostgreSQL 部署选项（多副本 / 高并发写；PG 14+)——取消注释并按企业库填写：
     # url: jdbc:postgresql://db.example.com:5432/oryxos
     # username: oryxos
     # password: ${ORYXOS_DB_PASSWORD}   # 凭证走环境变量注入，不明文写在这里
+
+# ── 多副本（026/027）──────────────────────────────────────
+# 双副本起步的正确性保障（同会话恰好一答/定时恰好一次/崩溃接管/企微不互踢），
+# 027 起文件面（Agent/Skill/人格/知识源）走共享卷 + DB 版本号总线秒级同步。
+# 需要：共享 PostgreSQL + 每副本唯一 instance-id + memory.backend 非 markdown
+#      + .oryxos 工作区放共享卷（支持矩阵见 docs/SharedVolumeGuide.md）。
+# oryxos:
+#   cluster:
+#     enabled: true
+#     instance-id: replica-1      # 每副本唯一；容器里可用 Pod 名
+#     workspace-poll-interval: 1s # 027 文件面变更感知轮询周期（默认 1s，变更 ≤3s 全副本生效）
   threads:
     virtual:
       enabled: true             # 宪法七：Java 21 虚拟线程扛并发，不引入异步框架
@@ -108,6 +119,16 @@ http:
     - media.discordapp.net      # Discord 入站媒体代理
     - "*.discordapp.com"        # Discord CDN 子域
     - "*.discordapp.net"        # Discord 媒体子域
+    - api.bot.qq.com            # QQ 官方 Bot OpenAPI + Gateway
+    - multimedia.nt.qq.com.cn   # QQ 入站附件 CDN
+    - "*.qq.com.cn"             # QQ 媒体子域
+    - "*.myqcloud.com"          # 腾讯云 COS 临时链（附件下载）
+    - "*.ugcimg.cn"             # QQ 语音 WAV（voice_wav_url，如 qqbot.ugcimg.cn）
+    - open.douyin.com           # 抖音开放平台 OpenAPI（私信发信）
+    - ilinkai.weixin.qq.com     # 个人微信 iLink Bot（getupdates / sendmessage）
+    - novac2c.cdn.weixin.qq.com # 个人微信 iLink 入站媒体 CDN
+    - "*.weixin.qq.com"         # 微信 CDN / 头像等子域
+    - openapi.alipay.com        # 支付宝生活号 custom.send / OpenAPI
     - api.open-meteo.com        # 天气 Agent 免 key 天气源（31 节 Demo 一）
     - hn.algolia.com            # 科技日报 Agent 新闻源（31 节 Demo 二）
     - api.github.com            # GitHub 日报脚本子进程网络（31 节 Demo 三）
@@ -157,6 +178,41 @@ oryxos:
   # 建议与上面的 auth 同时开启——否则管理台数据页无凭据可用（启动会告警）。
   # web:
   #   apikey:
+  #     enabled: true
+  # 资源授权（039-identity-authorization）。默认关=现状完全不变（零破坏锚点）。
+  # 开启后，既有认证门产出的主体交给唯一决策点裁决：匿名主体默认拒绝（403），已认证主体至少需
+  # VIEWER（读工作区/审计），按 VIEWER ⊂ EDITOR ⊂ ADMIN 三档逐级放行。
+  # 注意三开关的关系：认证门（auth / apikey）不开时没有任何主体产出，授权会被短路为「放行但无主体」
+  # ——授权要有对象，先开认证。另：API Key 主体即使给 ADMIN 也不得管理成员与治理策略（保守上限）。
+  # roles 默认档：角色已落库后 default-user-roles / default-api-key-roles 均默认空（无角色即拒绝）。
+  # 启用 rbac 时 RbacStartupCheck 会 fail-closed：必须开 apikey，且库中至少一个 ADMIN
+  # （oryxos user role <name> ADMIN）；auth 关仅 WARN。勿依赖空默认档「偷偷」给权限。
+  # web:
+  #   rbac:
+  #     enabled: true
+  #     deny-anonymous: true
+  #     roles:
+  #       default-user-roles: []           # 空=拒绝；可选显式 [VIEWER]/[EDITOR]/[ADMIN]
+  #       default-api-key-roles: []        # 默认空 = 机器凭证不默认授权
+  # OIDC/SSO（040 / #461）。默认关=零行为变化。开启后浏览器走 /api/v1/auth/oidc/login；
+  # 须先 `oryxos user oidc-map <username> <issuer> <subject>` 建立映射（无 JIT 建号）。
+  # client-secret 勿提交、勿打日志。callback 只建 oryxos_session，不调用 AuthorizationService。
+  # web:
+  #   oidc:
+  #     enabled: true
+  #     issuer: https://idp.example.com
+  #     client-id: oryxos
+  #     client-secret: ${ORYXOS_OIDC_CLIENT_SECRET}
+  #     redirect-uri: https://oryxos.example.com/api/v1/auth/oidc/callback
+  #     scopes: openid profile email
+  #     # 可选：跳过 discovery 时显式端点
+  #     # authorization-endpoint:
+  #     # token-endpoint:
+  #     # jwks-uri:
+  # 资产治理（041 / #463）。默认关=零行为变化。开启后叠加 OFFLINE/PRIVATE 门禁，且必须同时
+  # 打开 rbac.enabled（无主体则跳过资产门禁）。仍只走 AuthorizationService.decide。
+  # web:
+  #   asset-governance:
   #     enabled: true
   # SSE 流式响应（019-sse-streaming）。消息端点带 Accept: text/event-stream 即流式返回，
   # 无需开关；heartbeat-seconds 为静默期心跳间隔（SSE 注释行，防代理空闲断连），默认 15。

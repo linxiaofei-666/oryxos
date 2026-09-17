@@ -7,7 +7,7 @@
     <parent>
         <groupId>io.oryxos</groupId>
         <artifactId>oryxos</artifactId>
-        <version>0.1.4-RELEASE</version>
+        <version>0.1.5-RELEASE</version>
     </parent>
 
     <artifactId>oryxos-boot</artifactId>
@@ -90,6 +90,34 @@
         </dependency>
         <dependency>
             <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-qq</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-douyin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin-kf</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin-mp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-weixin-mini</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
+            <artifactId>oryxos-channel-alipay</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.oryxos</groupId>
             <artifactId>oryxos-web</artifactId>
         </dependency>
         <dependency>
@@ -109,6 +137,12 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <!-- #471：指标 OTLP 导出（与 039 trace 导出并列成对）——默认禁用（application.yml
+             management.otlp.metrics.export.enabled=false），配置 url 后推送 OTel collector -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-otlp</artifactId>
         </dependency>
 
         <!-- Structured JSON logging (prod profile) -->

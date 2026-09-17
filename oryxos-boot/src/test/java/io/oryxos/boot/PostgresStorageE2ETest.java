@@ -187,7 +187,10 @@ class PostgresStorageE2ETest {
         });
   }
 
-  /** postgresql 目录只有 V1 基线；空库无 baseline 行（baseline-on-migrate 只对存量非空库生效）——恰 1 条。 */
+  /**
+   * postgresql 目录现为 V1 基线 + V6 Run 工作台 + V7 协调面（026）+ V8 文件面（027）+ V9 Web 用户角色（039）+ V10 OIDC
+   * identity（040）+ V11 资产治理事件（041）；空库无 baseline 行——恰 7 条成功记录。
+   */
   private static void assertFlywayHistoryHealthy() throws Exception {
     try (Connection connection = postgres.getPostgresDatabase().getConnection();
         Statement statement = connection.createStatement();
@@ -195,7 +198,7 @@ class PostgresStorageE2ETest {
             statement.executeQuery(
                 "SELECT COUNT(*) FROM flyway_schema_history WHERE success = true")) {
       assertTrue(rows.next());
-      assertEquals(1, rows.getLong(1));
+      assertEquals(7, rows.getLong(1));
     }
   }
 

@@ -28,7 +28,8 @@ import org.springframework.web.client.RestClientResponseException;
  */
 class VendorNotifyAdapterTest {
 
-  private record ReceivedRequest(String query, String body) {}
+  private record ReceivedRequest(
+      String method, String path, String query, String body, String authorization) {}
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -57,7 +58,13 @@ class VendorNotifyAdapterTest {
 
   private void record(HttpExchange exchange) throws IOException {
     String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
-    received.add(new ReceivedRequest(exchange.getRequestURI().getQuery(), body));
+    received.add(
+        new ReceivedRequest(
+            exchange.getRequestMethod(),
+            exchange.getRequestURI().getRawPath(),
+            exchange.getRequestURI().getQuery(),
+            body,
+            exchange.getRequestHeaders().getFirst("Authorization")));
     byte[] payload = responseBody.getBytes(StandardCharsets.UTF_8);
     if (!responseBody.isEmpty()) {
       exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
@@ -446,5 +453,52 @@ class VendorNotifyAdapterTest {
         IllegalArgumentException.class,
         () -> new MatrixNotifyAdapter(poster).send(new NotifyTarget("matrix", Map.of()), "hi"));
     assertEquals(0, received.size());
+  }
+
+  @Test
+  @DisplayName("Matrix：homeserver + token + room_id 走 PUT m.room.message")
+  void matrixHomeserverPutBody() throws IOException {
+    new MatrixNotifyAdapter(poster)
+        .send(
+            new NotifyTarget(
+                "matrix",
+                Map.of(
+                    "homeserver",
+                    "http://127.0.0.1:" + server.getAddress().getPort(),
+                    "token",
+                    "tok",
+                    "room_id",
+                    "!r:hs")),
+            "日报来了");
+    JsonNode body = lastBody();
+    assertEquals("m.text", body.get("msgtype").asText());
+    assertEquals("日报来了", body.get("body").asText());
+    ReceivedRequest last = received.get(received.size() - 1);
+    assertEquals("PUT", last.method());
+    assertTrue(last.path().contains("%21r%3Ahs"));
+    assertTrue(!last.path().contains("%2521"), "房间 ID 不得二次编码");
+  }
+
+  @Test
+  @DisplayName("QQ：缺配置点名拒绝")
+  void qqRejectsMissingTarget() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new QqNotifyAdapter(poster).send(new NotifyTarget("qq", Map.of()), "hi"));
+    assertEquals(0, received.size());
+  }
+
+  @Test
+  @DisplayName("QQ：url + token 体为 msg_type=0 + content")
+  void qqNotifyBody() throws IOException {
+    new QqNotifyAdapter(poster)
+        .send(
+            new NotifyTarget("qq", Map.of("url", url(), "token", "atok", "group_openid", "g1")),
+            "告警");
+    JsonNode body = lastBody();
+    assertEquals(0, body.get("msg_type").asInt());
+    assertEquals("告警", body.get("content").asText());
+    ReceivedRequest last = received.get(received.size() - 1);
+    assertEquals("QQBot atok", last.authorization());
   }
 }

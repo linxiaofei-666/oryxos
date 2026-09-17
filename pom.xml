@@ -13,7 +13,7 @@
 
     <groupId>io.oryxos</groupId>
     <artifactId>oryxos</artifactId>
-    <version>0.1.4-RELEASE</version>
+    <version>0.1.5-RELEASE</version>
     <packaging>pom</packaging>
 
     <name>OryxOS</name>
@@ -81,6 +81,13 @@
         <module>oryxos-channel-gchat</module>
         <module>oryxos-channel-mattermost</module>
         <module>oryxos-channel-matrix</module>
+        <module>oryxos-channel-qq</module>
+        <module>oryxos-channel-douyin</module>
+        <module>oryxos-channel-weixin</module>
+        <module>oryxos-channel-weixin-kf</module>
+        <module>oryxos-channel-weixin-mp</module>
+        <module>oryxos-channel-weixin-mini</module>
+        <module>oryxos-channel-alipay</module>
         <module>oryxos-web</module>
         <module>oryxos-storage</module>
         <module>oryxos-cli</module>
@@ -96,6 +103,40 @@
                 <version>${spring-ai.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+
+            <!-- 039：OpenTelemetry BOM——trace 导出（SpanRecorder 的装配层实现），版本统一由 BOM 管理 -->
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-bom</artifactId>
+                <version>1.44.1</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- 039：OTLP exporter 经 okhttp 传递带入 kotlin-stdlib 1.9.25——CVE-2026-53914（9.8，
+                 <2.4.20 反序列化）OWASP 门禁阻断，钉到修复版（okhttp 4.x 与 kotlin-stdlib 2.x 二进制兼容） -->
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-stdlib</artifactId>
+                <version>2.4.20</version>
+            </dependency>
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-stdlib-jdk8</artifactId>
+                <version>2.4.20</version>
+            </dependency>
+            <dependency>
+                <groupId>org.jetbrains.kotlin</groupId>
+                <artifactId>kotlin-stdlib-jdk7</artifactId>
+                <version>2.4.20</version>
+            </dependency>
+            <!-- kotlin-stdlib-common 2.x 起只发 pom 无 jar（classes 并入主件），不可钉版本；
+                 升 okio 到 3.9+（其 okio-jvm 直依 kotlin-stdlib，不再传递引入 common）断根 -->
+            <dependency>
+                <groupId>com.squareup.okio</groupId>
+                <artifactId>okio</artifactId>
+                <version>3.9.1</version>
             </dependency>
 
             <!-- Internal modules -->
@@ -191,6 +232,41 @@
             </dependency>
             <dependency>
                 <groupId>io.oryxos</groupId>
+                <artifactId>oryxos-channel-qq</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.oryxos</groupId>
+                <artifactId>oryxos-channel-douyin</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.oryxos</groupId>
+                <artifactId>oryxos-channel-weixin</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.oryxos</groupId>
+                <artifactId>oryxos-channel-weixin-kf</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.oryxos</groupId>
+                <artifactId>oryxos-channel-weixin-mp</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.oryxos</groupId>
+                <artifactId>oryxos-channel-weixin-mini</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.oryxos</groupId>
+                <artifactId>oryxos-channel-alipay</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.oryxos</groupId>
                 <artifactId>oryxos-web</artifactId>
                 <version>${project.version}</version>
             </dependency>
@@ -258,6 +334,36 @@
     <build>
         <pluginManagement>
             <plugins>
+                <!-- #453：构建环境硬约束（fail）+ 依赖收敛软检查（仅告警，存量收敛问题不阻断，
+                     待清零后再升 fail——避免一次性引爆）。 -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-enforcer-plugin</artifactId>
+                    <version>3.5.0</version>
+                    <executions>
+                        <execution>
+                            <id>enforce-environment</id>
+                            <goals><goal>enforce</goal></goals>
+                            <configuration>
+                                <rules>
+                                    <requireJavaVersion><version>[21,)</version></requireJavaVersion>
+                                    <requireMavenVersion><version>[3.8,)</version></requireMavenVersion>
+                                </rules>
+                            </configuration>
+                        </execution>
+                        <execution>
+                            <id>warn-dependency-convergence</id>
+                            <goals><goal>enforce</goal></goals>
+                            <configuration>
+                                <rules>
+                                    <dependencyConvergence/>
+                                </rules>
+                                <fail>false</fail>
+                            </configuration>
+                        </execution>
+                    </executions>
+                </plugin>
+
                 <!-- Tests: exclude @Tag("integration") by default (CI skips smoke ITs);
                      run locally with: mvn test -Dgroups=integration -DexcludedGroups= -->
                 <plugin>
