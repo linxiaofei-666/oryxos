@@ -3,11 +3,25 @@ import { ref, reactive, computed, nextTick, onMounted, onBeforeUnmount } from 'v
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import logoUrl from './assets/logo.svg'
+import { withRevision, rowsWithRevision, revisionHeaders } from './workspace-revision.js'
 import LoginView from './views/LoginView.vue'
 import RunManagementView from './features/runs/RunManagementView.vue'
+import TeamsManagementView from './features/teams/TeamsManagementView.vue'
+import IdentityMappingsView from './features/identity-mappings/IdentityMappingsView.vue'
+import ApprovalsView from './features/approvals/ApprovalsView.vue'
+import GovernanceRevisionHistory from './features/governance/GovernanceRevisionHistory.vue'
 import { isNearBottom } from './chat-scroll.js'
 import { applyRunNav, parseRunNav, runHash, runListHash } from './features/runs/run-navigation.js'
+import { DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS, normalizeMcpRequestTimeout } from './mcp-timeout.js'
 import { filterSkills, hiddenSelectedCount, selectAllVisible, clearVisible, renderSet } from './skill-filter.js'
+import {
+  blankGov,
+  createGovernanceEdit,
+  loadGovernance,
+  startEditGovernance as beginGovEdit,
+  cancelEditGovernance as abortGovEdit,
+  saveGovernance as persistGovernance,
+} from './features/governance/governance-edit.js'
 
 // —— 012-web-auth US3：登录守卫 —— 未登录先查 /api/v1/auth/me；登录页 LoginView 调 /auth/login
 const auth = reactive({ checking: true, enabled: true, username: null })
@@ -67,8 +81,12 @@ const RUNTIME_NAV = [
   { key: 'mcp', label: 'MCP 管理' },
   { key: 'tools', label: 'Tool 列表', path: '/api/v1/tools' },
   { key: 'notify-channels', label: 'Notify 渠道' },
+  { key: 'inbound-channels', label: '入站渠道' },
+  { key: 'teams', label: '团队与组织' },
+  { key: 'identity-mappings', label: 'OIDC 映射' },
   { key: 'whitelist', label: 'SandBox 列表' },
   { key: 'tool-policy', label: '工具策略' },
+  { key: 'approvals', label: 'HITL 审批' },
   { key: 'exec-backend', label: '执行后端' },
 ]
 
@@ -204,6 +222,7 @@ function select(key, options = {}) {
   if (key === 'agents') { agentDetail.value = null; fileView.value = null; loadAgents() }
   if (key === 'personas') { cancelPersonaForm(); loadPersonaPresets() }
   if (key === 'notify-channels') { cancelNc(); loadNotifyChannels() }
+  if (key === 'inbound-channels') { closeInboundChannelDetail(); loadInboundChannels() }
   if (key === 'providers') { cancelPv(); loadProviders() }
   if (key === 'whitelist') { cancelWl(); loadWhitelist() }
   if (key === 'tool-policy') { cancelTp(); loadToolPolicy() }
@@ -211,6 +230,9 @@ function select(key, options = {}) {
   if (key === 'skills') { cancelSkill(); closeSkillDetail(); loadSkills() }
   if (key === 'knowledge') { cancelKb(); closeKbDetail(); loadKnowledge() }
   if (key === 'overview') { loadOverviewStats() }
+  if (key === 'teams') { teamsViewRef.value?.load?.() }
+  if (key === 'identity-mappings') { identityMappingsViewRef.value?.load?.() }
+  if (key === 'approvals') { approvalsViewRef.value?.load?.() }
   if (key === 'runs') {
     runViewRef.value?.load?.()
     if (!options.fromHash) writeRunHash(selectedRunId.value)
@@ -224,6 +246,10 @@ function refresh() {
   if (key === 'agents') { loadAgents(); return }
   if (key === 'personas') { loadPersonaPresets(); return }
   if (key === 'notify-channels') { loadNotifyChannels(); return }
+  if (key === 'inbound-channels') {
+    inboundChannelDetail.value ? openInboundChannelDetail(inboundChannelDetail.value.name) : loadInboundChannels()
+    return
+  }
   if (key === 'providers') { loadProviders(); return }
   if (key === 'whitelist') { loadWhitelist(); return }
   if (key === 'exec-backend') { loadExecBackend(); return }
@@ -231,6 +257,9 @@ function refresh() {
   if (key === 'skills') { loadSkills(); return }
   if (key === 'knowledge') { kbDetail.value ? refreshKbDetail(kbDetail.value.name) : loadKnowledge(); return }
   if (key === 'overview') { loadOverviewStats(); return }
+  if (key === 'teams') { teamsViewRef.value?.load?.(); return }
+  if (key === 'identity-mappings') { identityMappingsViewRef.value?.load?.(); return }
+  if (key === 'approvals') { approvalsViewRef.value?.load?.(); return }
   if (key === 'runs') { runViewRef.value?.load?.(); return }
   if (key === 'report') { loadReport(); return }
   if (NAV.find((n) => n.key === key)?.path) load(key)
@@ -246,18 +275,19 @@ async function loadKnowledge() {
     const res = await fetch('/api/v1/knowledge')
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
-    kb.value = { loading: false, error: null, data: body.data || [] }
+    kb.value = { loading: false, error: null, data: rowsWithRevision(body.data, res) }
   } catch (e) { kb.value = { loading: false, error: e.message, data: [] } }
 }
 function cancelKb() { kbForm.open = false; kbForm.name = ''; kbForm.description = ''; kbForm.busy = false; kbForm.error = '' }
 function closeKbDetail() { kbDetail.value = null }
 async function refreshKbDetail(name) {
   kbDetail.value = { ...(kbDetail.value || { name }), name, loading: true, error: null, busy: false }
+  loadKbGovernance(name)
   try {
     const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}`)
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
-    kbDetail.value = { name, base: body.data.base, documents: body.data.documents || [], loading: false, error: null, busy: false }
+    kbDetail.value = { revision: res.headers.get('X-Workspace-Revision'), name, base: body.data.base, documents: body.data.documents || [], loading: false, error: null, busy: false }
     loadKbMetrics(kbMetrics.range)
   } catch (e) { kbDetail.value = { name, base: null, documents: [], loading: false, error: e.message, busy: false } }
 }
@@ -276,7 +306,7 @@ async function createKb() {
 async function deleteKb(name) {
   if (!confirm(`删除知识库「${name}」？（目录与索引一并删除）`)) return
   try {
-    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}`, { method: 'DELETE', headers: revisionHeaders(kb.value.data.find((b) => b.name === name)?._workspaceRevision) })
     const body = await res.json()
     if (body.code !== 0) {
       // 409：被 Agent 引用——点名引用方（FR-011）
@@ -296,7 +326,7 @@ async function uploadKbDoc(event) {
   try {
     const form = new FormData()
     form.append('file', file)
-    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/documents`, { method: 'POST', body: form })
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/documents`, { method: 'POST', headers: revisionHeaders(kbDetail.value.revision), body: form })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '上传失败')
     await refreshKbDetail(name)
@@ -441,7 +471,7 @@ async function deleteKbDoc(relPath) {
   if (!confirm(`删除文档「${relPath}」？（源文件与索引片段一并删除）`)) return
   const name = kbDetail.value.name
   try {
-    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/documents?path=${encodeURIComponent(relPath)}`, { method: 'DELETE' })
+    const res = await fetch(`/api/v1/knowledge/${encodeURIComponent(name)}/documents?path=${encodeURIComponent(relPath)}`, { method: 'DELETE', headers: revisionHeaders(kbDetail.value.revision) })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '删除失败')
     await refreshKbDetail(name)
@@ -484,7 +514,7 @@ async function loadSkills() {
     const res = await fetch('/api/v1/skills')
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
-    skills.value = { loading: false, error: null, data: body.data || [] }
+    skills.value = { loading: false, error: null, data: rowsWithRevision(body.data, res) }
   } catch (e) { skills.value = { loading: false, error: e.message, data: [] } }
 }
 const skillForm = reactive({ open: false, editing: null, name: '', description: '', body: '', busy: false, error: null })
@@ -493,6 +523,7 @@ function newSkill() {
   skillForm.error = null; skillForm.open = true
 }
 function editSkill(row) {
+  skillForm.revision = row._workspaceRevision
   skillForm.editing = row.name; skillForm.name = row.name
   skillForm.description = row.description || ''; skillForm.body = row.body || ''
   skillForm.error = null; skillForm.open = true
@@ -510,7 +541,7 @@ async function saveSkill() {
       : { name: skillForm.name, description: skillForm.description, body: skillForm.body }
     const res = await fetch(url, {
       method: skillForm.editing ? 'PUT' : 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(skillForm.editing ? revisionHeaders(skillForm.revision) : {}) },
       body: JSON.stringify(payload),
     })
     const body = await res.json()
@@ -521,7 +552,7 @@ async function saveSkill() {
 async function deleteSkill(name) {
   if (!confirm(`归档 Skill「${name}」？存在活跃或归档 Agent 引用时会拒绝，实体不会被物理删除。`)) return
   try {
-    const res = await fetch(`/api/v1/skills/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    const res = await fetch(`/api/v1/skills/${encodeURIComponent(name)}`, { method: 'DELETE', headers: revisionHeaders(skills.value.data.find((s) => s.name === name)?._workspaceRevision) })
     const body = await res.json()
     if (body.code !== 0) {
       const refs = (body.data?.references || []).map((r) => `${r.agentName}(${r.state})`).join('、')
@@ -551,6 +582,7 @@ const skillDetail = ref(null) // { name, description, body, loading, error, node
 async function openSkillDetail(row) {
   skillDetail.value = { name: row.name, description: row.description || '', body: row.body || '', loading: true, error: null, node: null }
   fileView.value = null // 从「未选中」开始，避免跨视图串台预览
+  loadSkillGovernance(row.name)
   try {
     const res = await fetch('/api/v1/workspace/tree')
     const body = await res.json()
@@ -666,6 +698,9 @@ const agents = ref({ loading: false, error: null, data: [] })
 const triggering = ref(null) // 正在“立即触发”的 agent 名，防重复点击
 const selectedRunId = ref(null)
 const runViewRef = ref(null)
+const teamsViewRef = ref(null)
+const identityMappingsViewRef = ref(null)
+const approvalsViewRef = ref(null)
 
 function writeRunHash(runId) {
   const next = runId ? runHash(runId) : runListHash()
@@ -706,7 +741,7 @@ async function loadAgents() {
     const res = await fetch('/api/v1/agents')
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
-    agents.value = { loading: false, error: null, data: body.data || [] }
+    agents.value = { loading: false, error: null, data: rowsWithRevision(body.data, res), revision: res.headers.get('X-Workspace-Revision') }
   } catch (e) {
     agents.value = { loading: false, error: e.message, data: [] }
   }
@@ -717,7 +752,7 @@ async function loadAgents() {
 const agentCreate = reactive({
   open: false, name: '', description: '', provider: '', model: '', notifyChannel: '', skills: [],
   requiredSkills: [], suggestedSkills: [], knowledge: [], suggestedKnowledge: [],
-  files: null, busy: false, error: '',
+  files: null, busy: false, error: '', revision: null,
 })
 
 // 新建页用的 provider / model 下拉数据源：provider 来自 GET /providers；model 来自 GET /providers/{name}/models（服务端代理）
@@ -747,6 +782,7 @@ function onProviderChange() { agentCreate.model = ''; loadCreateModels(agentCrea
 // 打开新建页：重置字段 + 拉通知渠道下拉数据
 function openCreate() {
   agentCreate.open = true
+  agentCreate.revision = agents.value.revision
   agentCreate.name = ''
   agentCreate.description = ''
   agentCreate.provider = ''
@@ -797,11 +833,11 @@ async function submitCreate() {
   try {
     const res = agentCreate.files
       ? await fetch(`/api/v1/agents/${encodeURIComponent(agentCreate.name)}/files`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json', ...revisionHeaders(agentCreate.revision) },
           body: JSON.stringify({ files: agentCreate.files, skillBindings: agentCreate.skills, knowledgeBindings: agentCreate.knowledge }),
         })
         : await fetch('/api/v1/agents', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          method: 'POST', headers: { 'Content-Type': 'application/json', ...revisionHeaders(agentCreate.revision) },
           body: JSON.stringify({ name: agentCreate.name, description: agentCreate.description, provider: agentCreate.provider || undefined, model: agentCreate.model || undefined, skillBindings: agentCreate.skills, knowledgeBindings: agentCreate.knowledge }),
         })
     const body = await res.json()
@@ -834,7 +870,7 @@ async function loadPersonaPresets() {
     const res = await fetch('/api/v1/personas')
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
-    personaPresets.value = { loading: false, error: null, data: body.data || [] }
+    personaPresets.value = { loading: false, error: null, data: rowsWithRevision(body.data, res) }
     personaPageError.value = ''
   } catch (e) { personaPresets.value = { loading: false, error: e.message, data: [] } }
 }
@@ -935,6 +971,7 @@ async function editPersona(p) {
     const res = await fetch(`/api/v1/personas/${encodeURIComponent(p.key)}`)
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
+    personaForm.revision = res.headers.get('X-Workspace-Revision')
     personaForm.open = true; personaForm.editing = true; personaForm.viewOnly = false
     personaForm.key = p.key; personaForm.sourceContent = body.data.sourceContent; personaForm.busy = false
   } catch (e) { personaPageError.value = e.message; personaForm.busy = false }
@@ -958,7 +995,7 @@ async function savePersonaForm() {
   try {
     const res = await fetch(personaForm.editing ? `/api/v1/personas/${encodeURIComponent(key)}` : '/api/v1/personas', {
       method: personaForm.editing ? 'PUT' : 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(personaForm.editing ? revisionHeaders(personaForm.revision) : {}) },
       body: JSON.stringify({ key, sourceContent: personaForm.sourceContent }),
     })
     const body = await res.json()
@@ -973,7 +1010,7 @@ async function deletePersona(p) {
   if (!window.confirm(`删除自定义人格「${p.label}」？此操作不可撤销。`)) return
   personaPageError.value = ''
   try {
-    const res = await fetch(`/api/v1/personas/${encodeURIComponent(p.key)}`, { method: 'DELETE' })
+    const res = await fetch(`/api/v1/personas/${encodeURIComponent(p.key)}`, { method: 'DELETE', headers: revisionHeaders(p._workspaceRevision) })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '删除失败')
     if (agentImport.selected === p.key) { agentImport.selected = '' }
@@ -1004,7 +1041,7 @@ async function triggerAgent(a) {
 async function deleteAgent(name) {
   if (!confirm(`删除 Agent「${name}」？（整个目录归档到 archive/，不物理删）`)) return
   try {
-    const res = await fetch(`/api/v1/agents/${encodeURIComponent(name)}`, { method: 'DELETE' })
+    const res = await fetch(`/api/v1/agents/${encodeURIComponent(name)}`, { method: 'DELETE', headers: revisionHeaders(agents.value.data.find((a) => a.name === name)?._workspaceRevision) })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '删除失败')
     if (agentDetail.value?.name === name) closeAgent()
@@ -1327,7 +1364,8 @@ function textToMap(text) {
 // 新建/编辑表单：editing 存被编辑 server 的 name（此时 name 只读），null 表示新建
 const mcpForm = reactive({
   open: false, editing: null, name: '', transport: 'stdio',
-  command: '', url: '', envText: '', headersText: '', busy: false, error: null,
+  command: '', url: '', requestTimeoutSeconds: DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS,
+  envText: '', headersText: '', busy: false, error: null,
 })
 
 function editMcp(row) {
@@ -1336,6 +1374,7 @@ function editMcp(row) {
   mcpForm.transport = row.transport || 'stdio'
   mcpForm.command = row.command || ''
   mcpForm.url = row.url || ''
+  mcpForm.requestTimeoutSeconds = row.requestTimeoutSeconds ?? DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS
   mcpForm.envText = mapToText(row.env)
   mcpForm.headersText = mapToText(row.headers)
   mcpForm.error = null
@@ -1344,12 +1383,14 @@ function editMcp(row) {
 
 function cancelMcp() {
   mcpForm.open = false; mcpForm.editing = null; mcpForm.name = ''; mcpForm.transport = 'stdio'
-  mcpForm.command = ''; mcpForm.url = ''; mcpForm.envText = ''; mcpForm.headersText = ''; mcpForm.error = null
+  mcpForm.command = ''; mcpForm.url = ''; mcpForm.requestTimeoutSeconds = DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS
+  mcpForm.envText = ''; mcpForm.headersText = ''; mcpForm.error = null
 }
 
 async function saveMcp() {
   mcpForm.busy = true; mcpForm.error = null
   try {
+    const requestTimeoutSeconds = normalizeMcpRequestTimeout(mcpForm.requestTimeoutSeconds)
     const url = mcpForm.editing
       ? `/api/v1/mcp-servers/${encodeURIComponent(mcpForm.editing)}`
       : '/api/v1/mcp-servers'
@@ -1357,6 +1398,7 @@ async function saveMcp() {
       name: mcpForm.name, transport: mcpForm.transport,
       command: mcpForm.transport === 'stdio' ? mcpForm.command : null,
       url: mcpForm.transport === 'http' ? mcpForm.url : null,
+      requestTimeoutSeconds,
       env: textToMap(mcpForm.envText), headers: textToMap(mcpForm.headersText),
     }
     const res = await fetch(url, {
@@ -1635,28 +1677,35 @@ async function openAgent(agent) {
   fileView.value = null
   resetChat()
   resetAgentMemory()
+  loadAgentGovernance(agent.name)
   try {
-    const [treeRes, bindingRes, kbRes] = await Promise.all([
+    const [treeRes, bindingRes, kbRes, agentRes] = await Promise.all([
       fetch('/api/v1/workspace/tree'),
       fetch(`/api/v1/agents/${encodeURIComponent(agent.name)}/skills`),
       fetch(`/api/v1/agents/${encodeURIComponent(agent.name)}/knowledge`),
+      fetch(`/api/v1/agents/${encodeURIComponent(agent.name)}`),
       loadSkills(), // Skill 绑定选择器的数据源：存在即已安装
       loadKnowledge(), // 知识库绑定选择器的数据源
     ])
+    const agentBody = await agentRes.json()
+    if (agentBody.code !== 0) throw new Error(agentBody.message || 'Agent 加载失败')
+    const freshAgent = withRevision(agentBody.data, agentRes)
     const body = await treeRes.json()
     const bindingBody = await bindingRes.json()
     const kbBody = await kbRes.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
     if (bindingBody.code !== 0) throw new Error(bindingBody.message || '绑定加载失败')
     if (kbBody.code !== 0) throw new Error(kbBody.message || '知识库绑定加载失败')
+    agentKb.revision = kbRes.headers.get('X-Workspace-Revision')
     agentKb.selected = (kbBody.data.bindings || []).map((b) => b.name)
     agentKb.issues = kbBody.data.issues || []
     const agentsNode = (body.data.children || []).find((c) => c.name === 'agents')
     const node = (agentsNode?.children || []).find((c) => c.name === agent.name) || null
     const outputTree = (body.data.children || []).find((c) => c.name === 'output') || null
+    agentBinding.revision = bindingRes.headers.get('X-Workspace-Revision')
     agentBinding.selected = (bindingBody.data.bindings || []).map((b) => b.name)
     agentBinding.issues = bindingBody.data.issues || []
-    agentDetail.value = { ...agentDetail.value, loading: false, node, outputTree }
+    agentDetail.value = { ...agentDetail.value, agent: freshAgent, loading: false, node, outputTree }
   } catch (e) {
     agentDetail.value = { ...agentDetail.value, loading: false, error: e.message }
   }
@@ -1667,11 +1716,12 @@ async function saveAgentBindings() {
   agentBinding.saving = true; agentBinding.error = null; agentBinding.saved = false
   try {
     const res = await fetch(`/api/v1/agents/${encodeURIComponent(agentDetail.value.name)}/skills`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      method: 'PUT', headers: { 'Content-Type': 'application/json', ...revisionHeaders(agentBinding.revision) },
       body: JSON.stringify({ skills: agentBinding.selected }),
     })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '保存绑定失败')
+    agentBinding.revision = res.headers.get('X-Workspace-Revision')
     agentBinding.selected = (body.data.bindings || []).map((b) => b.name)
     agentBinding.issues = body.data.issues || []
     agentBinding.saved = true
@@ -1689,11 +1739,12 @@ async function saveAgentKnowledge() {
   agentKb.saving = true; agentKb.error = null; agentKb.saved = false
   try {
     const res = await fetch(`/api/v1/agents/${encodeURIComponent(agentDetail.value.name)}/knowledge`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      method: 'PUT', headers: { 'Content-Type': 'application/json', ...revisionHeaders(agentKb.revision) },
       body: JSON.stringify({ knowledge: agentKb.selected }),
     })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '保存知识库绑定失败')
+    agentKb.revision = res.headers.get('X-Workspace-Revision')
     agentKb.selected = (body.data.bindings || []).map((b) => b.name)
     agentKb.issues = body.data.issues || []
     agentKb.saved = true
@@ -1709,7 +1760,7 @@ async function reloadAgent() {
     const res = await fetch(`/api/v1/agents/${encodeURIComponent(name)}`)
     const body = await res.json()
     if (body.code === 0 && body.data) {
-      agentDetail.value = { ...agentDetail.value, agent: body.data }
+      agentDetail.value = { ...agentDetail.value, agent: withRevision(body.data, res) }
     }
   } catch (e) {
     /* 元数据刷新失败不阻断，忽略 */
@@ -1747,6 +1798,7 @@ function detailTab(tab) {
 // —— 详情页「编辑基本信息」：结构化改 description / provider / model / skills（只动 AGENT.md frontmatter，正文与其它配置不动）——
 function startEditBasic() {
   const a = agentDetail.value?.agent || {}
+  editBasic.revision = a._workspaceRevision
   editBasic.description = a.description || ''
   editBasic.provider = a.provider || ''
   editBasic.model = a.model || ''
@@ -1776,7 +1828,7 @@ async function saveEditBasic() {
   const name = agentDetail.value.name
   try {
     const res = await fetch(`/api/v1/agents/${encodeURIComponent(name)}/basic`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      method: 'PUT', headers: { 'Content-Type': 'application/json', ...revisionHeaders(editBasic.revision) },
       body: JSON.stringify({
         description: editBasic.description,
         provider: editBasic.provider,
@@ -1794,6 +1846,7 @@ async function saveEditBasic() {
 const personaEdit = reactive({ open: false, name: '', role: '', traits: '', tone: '', values: '', boundaries: '', sampleStyle: '', saving: false, error: '' })
 function startEditPersona() {
   const p = (agentDetail.value && agentDetail.value.agent && agentDetail.value.agent.persona) || {}
+  personaEdit.revision = agentDetail.value?.agent?._workspaceRevision
   personaEdit.open = true
   personaEdit.name = p.name || ''
   personaEdit.role = p.role || ''
@@ -1811,7 +1864,7 @@ async function savePersona() {
   personaEdit.saving = true; personaEdit.error = ''
   try {
     const res = await fetch(`/api/v1/agents/${encodeURIComponent(agentDetail.value.name)}/persona`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      method: 'PUT', headers: { 'Content-Type': 'application/json', ...revisionHeaders(personaEdit.revision) },
       body: JSON.stringify({
         name: personaEdit.name.trim(), role: personaEdit.role.trim(),
         traits: personaEdit.traits.trim(), tone: personaEdit.tone.trim(),
@@ -1824,6 +1877,187 @@ async function savePersona() {
     personaEdit.open = false
     await reloadAgent()
   } catch (e) { personaEdit.error = e.message } finally { personaEdit.saving = false }
+}
+
+// —— 041 / #504：GOVERNANCE.yml 面板（agents / skills / knowledge 共用 helpers）——
+const governanceEdit = reactive(createGovernanceEdit())
+const skillGovernance = reactive(createGovernanceEdit())
+const kbGovernance = reactive(createGovernanceEdit())
+const agentGovRevRef = ref(null)
+const skillGovRevRef = ref(null)
+const kbGovRevRef = ref(null)
+const channelGovRevRef = ref(null)
+function loadAgentGovernance(name) {
+  return loadGovernance(governanceEdit, 'agents', name)
+}
+function startEditGovernance() {
+  beginGovEdit(governanceEdit)
+}
+function cancelEditGovernance() {
+  return abortGovEdit(governanceEdit, 'agents', agentDetail.value?.name)
+}
+async function saveGovernance() {
+  await persistGovernance(governanceEdit, 'agents', agentDetail.value?.name)
+  if (!governanceEdit.open) agentGovRevRef.value?.load()
+}
+function loadSkillGovernance(name) {
+  return loadGovernance(skillGovernance, 'skills', name)
+}
+function startEditSkillGovernance() {
+  beginGovEdit(skillGovernance)
+}
+function cancelEditSkillGovernance() {
+  return abortGovEdit(skillGovernance, 'skills', skillDetail.value?.name)
+}
+async function saveSkillGovernance() {
+  await persistGovernance(skillGovernance, 'skills', skillDetail.value?.name)
+  if (!skillGovernance.open) skillGovRevRef.value?.load()
+}
+function loadKbGovernance(name) {
+  return loadGovernance(kbGovernance, 'knowledge', name)
+}
+function startEditKbGovernance() {
+  beginGovEdit(kbGovernance)
+}
+function cancelEditKbGovernance() {
+  return abortGovEdit(kbGovernance, 'knowledge', kbDetail.value?.name)
+}
+async function saveKbGovernance() {
+  await persistGovernance(kbGovernance, 'knowledge', kbDetail.value?.name)
+  if (!kbGovernance.open) kbGovRevRef.value?.load()
+}
+function onAgentGovRestored() {
+  if (agentDetail.value?.name) loadAgentGovernance(agentDetail.value.name)
+}
+function onSkillGovRestored() {
+  if (skillDetail.value?.name) loadSkillGovernance(skillDetail.value.name)
+}
+function onKbGovRestored() {
+  if (kbDetail.value?.name) loadKbGovernance(kbDetail.value.name)
+}
+function onChannelGovRestored() {
+  if (inboundChannelDetail.value?.name) loadChannelGovernance(inboundChannelDetail.value.name)
+}
+
+// —— 041 / #504：入站渠道列表 + channels.yaml governance 面板 ——
+const inboundChannels = ref({ loading: false, error: null, data: [] })
+const inboundChannelDetail = ref(null) // { name, type, agent, enabled, loading, error }
+const channelGovernance = reactive({
+  open: false,
+  loading: false,
+  saving: false,
+  error: '',
+  owner: '',
+  version: '',
+  visibility: '',
+  riskLevel: '',
+  health: '',
+  teamOwner: '',
+  orgOwner: '',
+  loaded: false,
+})
+async function loadInboundChannels() {
+  inboundChannels.value = { loading: true, error: null, data: [] }
+  try {
+    const res = await fetch('/api/v1/channels')
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '加载失败')
+    inboundChannels.value = { loading: false, error: null, data: body.data || [] }
+  } catch (e) {
+    inboundChannels.value = { loading: false, error: e.message, data: [] }
+  }
+}
+function closeInboundChannelDetail() {
+  inboundChannelDetail.value = null
+  channelGovernance.open = false
+  channelGovernance.loaded = false
+}
+async function openInboundChannelDetail(nameOrRow) {
+  const name = typeof nameOrRow === 'string' ? nameOrRow : nameOrRow?.name
+  if (!name) return
+  const row = inboundChannels.value.data.find((c) => c.name === name) || nameOrRow
+  inboundChannelDetail.value = {
+    name,
+    type: row?.type || '—',
+    agent: row?.agent || '—',
+    enabled: row?.enabled !== false,
+    loading: false,
+    error: null,
+  }
+  await loadChannelGovernance(name)
+}
+async function loadChannelGovernance(name) {
+  channelGovernance.loading = true
+  channelGovernance.error = ''
+  channelGovernance.open = false
+  channelGovernance.loaded = false
+  try {
+    const res = await fetch(`/api/v1/channels/${encodeURIComponent(name)}/governance`)
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '治理加载失败')
+    const g = body.data || {}
+    channelGovernance.owner = g.owner || ''
+    channelGovernance.version = g.version || ''
+    channelGovernance.visibility = g.visibility || ''
+    channelGovernance.riskLevel = g.riskLevel || ''
+    channelGovernance.health = g.health || ''
+    channelGovernance.teamOwner = g.teamOwner || ''
+    channelGovernance.orgOwner = g.orgOwner || ''
+    channelGovernance.loaded = true
+  } catch (e) {
+    channelGovernance.error = e.message
+  } finally {
+    channelGovernance.loading = false
+  }
+}
+function startEditChannelGovernance() {
+  channelGovernance.open = true
+  channelGovernance.error = ''
+  channelGovernance.saving = false
+}
+async function cancelEditChannelGovernance() {
+  channelGovernance.open = false
+  if (inboundChannelDetail.value?.name) await loadChannelGovernance(inboundChannelDetail.value.name)
+}
+async function saveChannelGovernance() {
+  if (!inboundChannelDetail.value) return
+  channelGovernance.saving = true
+  channelGovernance.error = ''
+  try {
+    const res = await fetch(
+      `/api/v1/channels/${encodeURIComponent(inboundChannelDetail.value.name)}/governance`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          owner: channelGovernance.owner.trim() || null,
+          version: channelGovernance.version.trim() || null,
+          visibility: channelGovernance.visibility.trim() || null,
+          riskLevel: channelGovernance.riskLevel.trim() || null,
+          health: channelGovernance.health.trim() || null,
+          teamOwner: channelGovernance.teamOwner.trim() || null,
+          orgOwner: channelGovernance.orgOwner.trim() || null,
+        }),
+      },
+    )
+    const body = await res.json()
+    if (body.code !== 0) throw new Error(body.message || '保存失败')
+    const g = body.data || {}
+    channelGovernance.owner = g.owner || ''
+    channelGovernance.version = g.version || ''
+    channelGovernance.visibility = g.visibility || ''
+    channelGovernance.riskLevel = g.riskLevel || ''
+    channelGovernance.health = g.health || ''
+    channelGovernance.teamOwner = g.teamOwner || ''
+    channelGovernance.orgOwner = g.orgOwner || ''
+    channelGovernance.open = false
+    channelGovernance.loaded = true
+    channelGovRevRef.value?.load()
+  } catch (e) {
+    channelGovernance.error = e.message
+  } finally {
+    channelGovernance.saving = false
+  }
 }
 
 // —— 执行历史 tab：该 Agent 每次触发的起止时间 / 状态 / 时长（手动 + 定时）——
@@ -2003,7 +2237,7 @@ async function openFile(node) {
     const res = await fetch(`/api/v1/workspace/file?path=${encodeURIComponent(node.path)}`)
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '加载失败')
-    fileView.value = { path: node.path, loading: false, error: null, content: body.data, saving: false, saved: false }
+    fileView.value = { path: node.path, loading: false, error: null, content: body.data, revision: res.headers.get('X-Workspace-Revision'), saving: false, saved: false }
   } catch (e) {
     fileView.value = { path: node.path, loading: false, error: e.message, content: '', saving: false, saved: false }
   }
@@ -2015,12 +2249,12 @@ async function saveFile() {
   fileView.value = { ...fileView.value, saving: true, error: null, saved: false }
   try {
     const res = await fetch('/api/v1/workspace/file', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...revisionHeaders(fileView.value.revision) },
       body: JSON.stringify({ path: fileView.value.path, content: fileView.value.content }),
     })
     const body = await res.json()
     if (body.code !== 0) throw new Error(body.message || '保存失败')
-    fileView.value = { ...fileView.value, saving: false, saved: true }
+    fileView.value = { ...fileView.value, saving: false, saved: true, revision: res.headers.get('X-Workspace-Revision') }
     if (fileView.value.path.endsWith('/AGENT.md')) await reloadAgent()
   } catch (e) {
     fileView.value = { ...fileView.value, saving: false, error: e.message }
@@ -2156,6 +2390,17 @@ const outputRows = computed(() =>
               @close="closeRunWorkbench"
               @go-agents="select('agents')"
             />
+          </div>
+
+          <div v-if="active === 'teams'">
+            <TeamsManagementView ref="teamsViewRef" />
+          </div>
+
+          <div v-if="active === 'identity-mappings'">
+            <IdentityMappingsView ref="identityMappingsViewRef" />
+          </div>
+          <div v-if="active === 'approvals'">
+            <ApprovalsView ref="approvalsViewRef" />
           </div>
 
           <!-- 报表（016 审计看板）：KPI 汇总 + 分布条形图 + 明细下钻；时间窗三档 -->
@@ -2409,6 +2654,62 @@ const outputRows = computed(() =>
               <button class="btn back" @click="closeSkillDetail">← 返回 Skill 列表</button>
               <div class="sess-meta"><span>Skill</span><span class="mono">{{ skillDetail.name }}</span></div>
               <p class="empty">{{ skillDetail.description || '—' }}</p>
+              <!-- 041 / #504：Skill GOVERNANCE.yml -->
+              <div style="margin:12px 0 16px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!skillGovernance.open && skillGovernance.loaded" class="btn" @click="startEditSkillGovernance">编辑治理</button>
+                </div>
+                <p v-if="skillGovernance.loading" class="empty">加载治理…</p>
+                <p v-else-if="skillGovernance.error && !skillGovernance.open" class="error">{{ skillGovernance.error }}</p>
+                <template v-else-if="skillGovernance.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="skillGovernance.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="skillGovernance.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="skillGovernance.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="skillGovernance.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="skillGovernance.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-row edit"><label class="k">teamOwner</label><input v-model="skillGovernance.teamOwner" class="gen-input" placeholder="团队 id（WORKSPACE；需开启 workspace-team-acl）" /></div>
+                    <div class="info-row edit"><label class="k">orgOwner</label><input v-model="skillGovernance.orgOwner" class="gen-input" placeholder="组织 id（WORKSPACE；需开启 workspace-org-acl）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="skillGovernance.saving" @click="saveSkillGovernance">保存</button>
+                      <button class="btn" :disabled="skillGovernance.saving" @click="cancelEditSkillGovernance">取消</button>
+                      <span v-if="skillGovernance.saving" class="empty">保存中…</span>
+                      <span v-if="skillGovernance.error" class="error">{{ skillGovernance.error }}</span>
+                    </div>
+                    <p class="empty">写入 Skill 目录 GOVERNANCE.yml。OFFLINE 时（需开启 rbac + asset-governance）不可绑定/调用；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="skillGovernance.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(skillGovernance.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(skillGovernance.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(skillGovernance.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(skillGovernance.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(skillGovernance.riskLevel) }}</span></div>
+                  <div class="info-row"><span class="k">teamOwner</span><span class="mono">{{ blankGov(skillGovernance.teamOwner) }}</span></div>
+                  <div class="info-row"><span class="k">orgOwner</span><span class="mono">{{ blankGov(skillGovernance.orgOwner) }}</span></div>
+                </div>
+                <GovernanceRevisionHistory
+                  v-if="skillDetail.name"
+                  ref="skillGovRevRef"
+                  api-kind="skills"
+                  :name="skillDetail.name"
+                  @restored="onSkillGovRestored"
+                />
+              </div>
               <p v-if="skillDetail.loading" class="empty">加载中…</p>
               <p v-else-if="skillDetail.error" class="error">出错：{{ skillDetail.error }}</p>
               <!-- 有真实目录子树 → 文件浏览器 -->
@@ -2495,6 +2796,62 @@ const outputRows = computed(() =>
             <div v-else>
               <button class="btn back" @click="closeKbDetail">← 返回知识库列表</button>
               <div class="sess-meta"><span>知识库</span><span class="mono">{{ kbDetail.name }}</span></div>
+              <!-- 041 / #504：Knowledge GOVERNANCE.yml -->
+              <div style="margin:12px 0 16px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!kbGovernance.open && kbGovernance.loaded" class="btn" @click="startEditKbGovernance">编辑治理</button>
+                </div>
+                <p v-if="kbGovernance.loading" class="empty">加载治理…</p>
+                <p v-else-if="kbGovernance.error && !kbGovernance.open" class="error">{{ kbGovernance.error }}</p>
+                <template v-else-if="kbGovernance.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="kbGovernance.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="kbGovernance.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="kbGovernance.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="kbGovernance.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="kbGovernance.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-row edit"><label class="k">teamOwner</label><input v-model="kbGovernance.teamOwner" class="gen-input" placeholder="团队 id（WORKSPACE；需开启 workspace-team-acl）" /></div>
+                    <div class="info-row edit"><label class="k">orgOwner</label><input v-model="kbGovernance.orgOwner" class="gen-input" placeholder="组织 id（WORKSPACE；需开启 workspace-org-acl）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="kbGovernance.saving" @click="saveKbGovernance">保存</button>
+                      <button class="btn" :disabled="kbGovernance.saving" @click="cancelEditKbGovernance">取消</button>
+                      <span v-if="kbGovernance.saving" class="empty">保存中…</span>
+                      <span v-if="kbGovernance.error" class="error">{{ kbGovernance.error }}</span>
+                    </div>
+                    <p class="empty">写入知识库目录 GOVERNANCE.yml。OFFLINE 时（需开启 rbac + asset-governance）不可检索/绑定；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="kbGovernance.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(kbGovernance.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(kbGovernance.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(kbGovernance.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(kbGovernance.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(kbGovernance.riskLevel) }}</span></div>
+                  <div class="info-row"><span class="k">teamOwner</span><span class="mono">{{ blankGov(kbGovernance.teamOwner) }}</span></div>
+                  <div class="info-row"><span class="k">orgOwner</span><span class="mono">{{ blankGov(kbGovernance.orgOwner) }}</span></div>
+                </div>
+                <GovernanceRevisionHistory
+                  v-if="kbDetail.name"
+                  ref="kbGovRevRef"
+                  api-kind="knowledge"
+                  :name="kbDetail.name"
+                  @restored="onKbGovRestored"
+                />
+              </div>
               <p v-if="kbDetail.loading" class="empty">加载中…</p>
               <template v-else>
                 <p class="empty">{{ kbDetail.base?.description || '—' }}（后端：{{ kbDetail.base?.backend || '—' }} · 状态：{{ kbDetail.base?.indexStatus || '—' }} · 片段 {{ kbDetail.base?.chunkCount ?? '—' }}）</p>
@@ -3011,6 +3368,63 @@ const outputRows = computed(() =>
                 </div>
               </div>
 
+              <!-- 041 / #504：GOVERNANCE.yml — health/owner/visibility（GET/PUT /agents/{name}/governance） -->
+              <div v-if="agentDetail.tab === 'info'" style="margin-top:14px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!governanceEdit.open && governanceEdit.loaded" class="btn" @click="startEditGovernance">编辑治理</button>
+                </div>
+                <p v-if="governanceEdit.loading" class="empty">加载治理…</p>
+                <p v-else-if="governanceEdit.error && !governanceEdit.open" class="error">{{ governanceEdit.error }}</p>
+                <template v-else-if="governanceEdit.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="governanceEdit.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="governanceEdit.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="governanceEdit.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="governanceEdit.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="governanceEdit.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-row edit"><label class="k">teamOwner</label><input v-model="governanceEdit.teamOwner" class="gen-input" placeholder="团队 id（WORKSPACE；需开启 workspace-team-acl）" /></div>
+                    <div class="info-row edit"><label class="k">orgOwner</label><input v-model="governanceEdit.orgOwner" class="gen-input" placeholder="组织 id（WORKSPACE；需开启 workspace-org-acl）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="governanceEdit.saving" @click="saveGovernance">保存</button>
+                      <button class="btn" :disabled="governanceEdit.saving" @click="cancelEditGovernance">取消</button>
+                      <span v-if="governanceEdit.saving" class="empty">保存中…</span>
+                      <span v-if="governanceEdit.error" class="error">{{ governanceEdit.error }}</span>
+                    </div>
+                    <p class="empty">写入 Agent 目录 GOVERNANCE.yml。OFFLINE 时（需开启 rbac + asset-governance）不可调用；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="governanceEdit.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(governanceEdit.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(governanceEdit.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(governanceEdit.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(governanceEdit.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(governanceEdit.riskLevel) }}</span></div>
+                  <div class="info-row"><span class="k">teamOwner</span><span class="mono">{{ blankGov(governanceEdit.teamOwner) }}</span></div>
+                  <div class="info-row"><span class="k">orgOwner</span><span class="mono">{{ blankGov(governanceEdit.orgOwner) }}</span></div>
+                </div>
+                <GovernanceRevisionHistory
+                  v-if="agentDetail.name"
+                  ref="agentGovRevRef"
+                  api-kind="agents"
+                  :name="agentDetail.name"
+                  @restored="onAgentGovRestored"
+                />
+              </div>
+
               <!-- Tab 3：文件浏览器（可编辑） -->
               <div v-else-if="agentDetail.tab === 'files'">
                 <p v-if="agentDetail.loading" class="empty">加载中…</p>
@@ -3429,6 +3843,92 @@ const outputRows = computed(() =>
             </table>
           </div>
 
+          <!-- 入站渠道（017/041）：列表 + 治理块（channels.yaml governance:）；CRUD 仍走 API/配置文件 -->
+          <div v-else-if="active === 'inbound-channels'">
+            <template v-if="!inboundChannelDetail">
+              <p class="empty">入站 IM 渠道来自 .oryxos/channels.yaml。本页只读列表并编辑治理块（OFFLINE/PRIVATE 等）；增删改渠道定义仍用 API 或改配置。</p>
+              <p v-if="inboundChannels.loading" class="empty">加载中…</p>
+              <p v-else-if="inboundChannels.error" class="error">出错：{{ inboundChannels.error }}</p>
+              <table v-else>
+                <thead><tr><th>name</th><th>type</th><th>agent</th><th>enabled</th><th style="width:90px">操作</th></tr></thead>
+                <tbody>
+                  <tr v-if="!inboundChannels.data.length"><td colspan="5" class="empty">（暂无入站渠道）</td></tr>
+                  <tr v-for="c in inboundChannels.data" :key="c.name">
+                    <td class="mono">{{ c.name }}</td>
+                    <td class="mono">{{ c.type }}</td>
+                    <td class="mono">{{ c.agent }}</td>
+                    <td>{{ c.enabled === false ? '否' : '是' }}</td>
+                    <td class="ops"><button class="btn" @click="openInboundChannelDetail(c)">治理</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </template>
+            <div v-else>
+              <button class="btn back" @click="closeInboundChannelDetail">← 返回入站渠道列表</button>
+              <div class="sess-meta"><span>入站渠道</span><span class="mono">{{ inboundChannelDetail.name }}</span></div>
+              <div class="info-grid" style="margin:8px 0">
+                <div class="info-row"><span class="k">type</span><span class="mono">{{ inboundChannelDetail.type }}</span></div>
+                <div class="info-row"><span class="k">agent</span><span class="mono">{{ inboundChannelDetail.agent }}</span></div>
+                <div class="info-row"><span class="k">enabled</span><span>{{ inboundChannelDetail.enabled ? '是' : '否' }}</span></div>
+              </div>
+              <div style="margin-top:14px">
+                <div class="sess-meta"><span>治理</span>
+                  <button v-if="!channelGovernance.open && channelGovernance.loaded" class="btn" @click="startEditChannelGovernance">编辑治理</button>
+                </div>
+                <p v-if="channelGovernance.loading" class="empty">加载治理…</p>
+                <p v-else-if="channelGovernance.error && !channelGovernance.open" class="error">{{ channelGovernance.error }}</p>
+                <template v-else-if="channelGovernance.open">
+                  <div class="gen-box">
+                    <div class="info-row edit"><label class="k">health</label>
+                      <select v-model="channelGovernance.health" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="ACTIVE">ACTIVE</option>
+                        <option value="DEPRECATED">DEPRECATED</option>
+                        <option value="OFFLINE">OFFLINE</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">owner</label><input v-model="channelGovernance.owner" class="gen-input" placeholder="属主用户名（可选）" /></div>
+                    <div class="info-row edit"><label class="k">visibility</label>
+                      <select v-model="channelGovernance.visibility" class="gen-input">
+                        <option value="">（未设）</option>
+                        <option value="PRIVATE">PRIVATE</option>
+                        <option value="WORKSPACE">WORKSPACE</option>
+                        <option value="PUBLIC">PUBLIC</option>
+                      </select>
+                    </div>
+                    <div class="info-row edit"><label class="k">version</label><input v-model="channelGovernance.version" class="gen-input" placeholder="版本（展示/审计）" /></div>
+                    <div class="info-row edit"><label class="k">riskLevel</label><input v-model="channelGovernance.riskLevel" class="gen-input" placeholder="风险等级（展示）" /></div>
+                    <div class="info-row edit"><label class="k">teamOwner</label><input v-model="channelGovernance.teamOwner" class="gen-input" placeholder="团队 id（WORKSPACE；需开启 workspace-team-acl）" /></div>
+                    <div class="info-row edit"><label class="k">orgOwner</label><input v-model="channelGovernance.orgOwner" class="gen-input" placeholder="组织 id（WORKSPACE；需开启 workspace-org-acl）" /></div>
+                    <div class="info-actions">
+                      <button class="btn btn-primary" :disabled="channelGovernance.saving" @click="saveChannelGovernance">保存</button>
+                      <button class="btn" :disabled="channelGovernance.saving" @click="cancelEditChannelGovernance">取消</button>
+                      <span v-if="channelGovernance.saving" class="empty">保存中…</span>
+                      <span v-if="channelGovernance.error" class="error">{{ channelGovernance.error }}</span>
+                    </div>
+                    <p class="empty">写入 channels.yaml 的 governance 块（非 GOVERNANCE.yml）。OFFLINE 时（需开启 rbac + asset-governance）入站消息被拒；PRIVATE 仅属主/ADMIN 可管。空值表示未设治理。</p>
+                  </div>
+                </template>
+                <div v-else-if="channelGovernance.loaded" class="info-grid">
+                  <div class="info-row"><span class="k">health</span><span class="mono">{{ blankGov(channelGovernance.health) }}</span></div>
+                  <div class="info-row"><span class="k">owner</span><span>{{ blankGov(channelGovernance.owner) }}</span></div>
+                  <div class="info-row"><span class="k">visibility</span><span class="mono">{{ blankGov(channelGovernance.visibility) }}</span></div>
+                  <div class="info-row"><span class="k">version</span><span>{{ blankGov(channelGovernance.version) }}</span></div>
+                  <div class="info-row"><span class="k">riskLevel</span><span>{{ blankGov(channelGovernance.riskLevel) }}</span></div>
+                  <div class="info-row"><span class="k">teamOwner</span><span class="mono">{{ blankGov(channelGovernance.teamOwner) }}</span></div>
+                  <div class="info-row"><span class="k">orgOwner</span><span class="mono">{{ blankGov(channelGovernance.orgOwner) }}</span></div>
+                </div>
+                <GovernanceRevisionHistory
+                  v-if="inboundChannelDetail.name"
+                  ref="channelGovRevRef"
+                  api-kind="channels"
+                  :name="inboundChannelDetail.name"
+                  @restored="onChannelGovRestored"
+                />
+              </div>
+            </div>
+          </div>
+
           <!-- Provider：命名模型 Provider 的 CRUD（新建/编辑/删除），apiKey 明文展示 -->
           <div v-else-if="active === 'providers'">
             <div class="toolbar">
@@ -3575,6 +4075,8 @@ const outputRows = computed(() =>
                   </select>
                   <input v-if="mcpForm.transport === 'stdio'" v-model="mcpForm.command" class="gen-input" placeholder="command，如 npx -y @modelcontextprotocol/server-github" />
                   <input v-else v-model="mcpForm.url" class="gen-input" placeholder="url，如 https://api.githubcopilot.com/mcp/" />
+                  <label class="empty" style="display:block">请求超时（秒，1–3600；连接初始化仍由 SDK 的 20 秒上限约束）</label>
+                  <input v-model.number="mcpForm.requestTimeoutSeconds" class="gen-input" type="number" min="1" max="3600" step="1" />
                   <label class="empty" style="display:block">env（每行一条 KEY=VALUE，支持 ${ENV_VAR} 占位）</label>
                   <textarea v-model="mcpForm.envText" class="gen-draft mono" rows="3" placeholder="GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_TOKEN}"></textarea>
                   <label class="empty" style="display:block">headers（每行一条 KEY=VALUE；当前 http 传输暂不支持自定义请求头，仅作记录）</label>
@@ -3590,13 +4092,14 @@ const outputRows = computed(() =>
             <p v-if="mcp.loading" class="empty">加载中…</p>
             <p v-else-if="mcp.error" class="error">出错：{{ mcp.error }}</p>
             <table v-else>
-              <thead><tr><th>name</th><th>transport</th><th>command / url</th><th>状态</th><th>工具</th><th>操作</th></tr></thead>
+              <thead><tr><th>name</th><th>transport</th><th>command / url</th><th>timeout</th><th>状态</th><th>工具</th><th>操作</th></tr></thead>
               <tbody>
-                <tr v-if="!mcp.data.length"><td colspan="6" class="empty">（暂无 MCP server · 上面选个内置目录一键启用，或点「手动添加」）</td></tr>
+                <tr v-if="!mcp.data.length"><td colspan="7" class="empty">（暂无 MCP server · 上面选个内置目录一键启用，或点「手动添加」）</td></tr>
                 <tr v-for="m in mcp.data" :key="m.name">
                   <td class="mono">{{ m.name }}</td>
                   <td>{{ m.transport }}</td>
                   <td class="mono">{{ m.transport === 'stdio' ? m.command : m.url }}</td>
+                  <td class="mono">{{ m.requestTimeoutSeconds }}s</td>
                   <td>
                     <span v-if="mcpStatusByName[m.name]?.connected" class="ok">已连接</span>
                     <span v-else class="off" :title="mcpStatusByName[m.name]?.error || ''">未连接</span>

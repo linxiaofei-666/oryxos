@@ -1,5 +1,6 @@
 package io.oryxos.core.agent;
 
+import io.oryxos.core.durable.ApprovalSuspendedException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -61,7 +62,9 @@ public class AgentExecutionService {
       String agentName, String source, String sessionId, String inputPreview, Runnable work) {
     // 021 唯一跨线程传递点（R4）：主线程生成 trace → 落执行记录（store 自读上下文）→ 显式传入后台虚拟线程。
     // ThreadLocal 不跨线程，靠闭包捕获的 traceId 在后台线程重新置入，work 内 AgentService 兜底 openIfAbsent 复用同值。
+    // 039 / #529：同样捕获 PrincipalContext（入站 webhook 在提交前 set；web 开跑路径可另走 RuntimeAgentGuard）。
     final String traceId;
+    final io.oryxos.core.auth.Principal actor = io.oryxos.core.auth.PrincipalContext.current();
     final long id;
     try (TraceContext.Scope scope = TraceContext.openIfAbsent()) {
       traceId = scope.traceId();
@@ -69,8 +72,17 @@ public class AgentExecutionService {
     }
     executor.execute(
         () -> {
-          try (TraceContext.Scope scope = TraceContext.open(traceId)) {
-            runInContext(id, agentName, source, sessionId, work);
+          try (TraceContext.Scope ignored = TraceContext.open(traceId)) {
+            if (actor != null) {
+              io.oryxos.core.auth.PrincipalContext.set(actor);
+            }
+            try {
+              runInContext(id, agentName, source, sessionId, work);
+            } finally {
+              if (actor != null) {
+                io.oryxos.core.auth.PrincipalContext.clear();
+              }
+            }
           }
         });
     return id;
@@ -117,6 +129,10 @@ public class AgentExecutionService {
     Instant now = clock.instant();
     for (AgentExecution row : store.listNonTerminal()) {
       if (runningThreads.containsKey(row.id())) {
+        continue;
+      }
+      if ("WAITING_APPROVAL".equals(row.status())) {
+        // 043 / #465：审批挂起必须跨重启保留
         continue;
       }
       if (store.tryFinish(
@@ -192,6 +208,20 @@ public class AgentExecutionService {
         throw new RunCancelledException();
       }
       ok = true;
+    } catch (ApprovalSuspendedException e) {
+      store.markWaitingApproval(id, clock.instant());
+      publish(
+          id,
+          AgentRunEventTypes.RUN_WAITING_APPROVAL,
+          Map.of(
+              "checkpointId",
+              e.checkpointId() == null ? "" : e.checkpointId(),
+              "idempotencyKey",
+              e.idempotencyKey() == null ? "" : e.idempotencyKey(),
+              "message",
+              e.getMessage() == null ? "等待人工审批" : e.getMessage()));
+      LOG.info("Run {} 进入 WAITING_APPROVAL checkpoint={}", id, e.checkpointId());
+      return; // 非终态：不 finish
     } catch (RunCancelledException e) {
       cancelled = true;
       error = e.getMessage();

@@ -4,6 +4,13 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.oryxos.core.OryxTool;
 import io.oryxos.core.ToolResult;
+import io.oryxos.core.auth.Principal;
+import io.oryxos.core.auth.PrincipalContext;
+import io.oryxos.core.durable.ApprovalGrantContext;
+import io.oryxos.core.durable.DurableTaskService;
+import io.oryxos.core.policy.Action;
+import io.oryxos.core.policy.AuthorizationService;
+import io.oryxos.core.policy.ResourceRef;
 import io.oryxos.core.profile.Profile;
 import io.oryxos.core.profile.ProfileRegistry;
 import io.oryxos.core.provider.ToolCallRequest;
@@ -36,11 +43,33 @@ public class ToolExecutor {
   /** 审计的策略拒绝标记（tool_invocations.blocked_by，020 FR-006）。 */
   private static final String POLICY_BLOCKED = "policy";
 
+  /** 审计的授权拒绝标记（039 / #527：与 policy 正交）。 */
+  private static final String AUTHZ_BLOCKED = "authz";
+
+  /** 审计的审批闸标记（042 / #464：与 policy/authz 正交）。 */
+  private static final String APPROVAL_BLOCKED = "approval";
+
   private final Map<String, String> mcpToolOwners;
 
   /** 020 工具策略（事中保险）。默认 ALLOW_ALL——旧构造/未装配策略时行为与现状一致。 */
   private io.oryxos.core.policy.ToolPolicyService toolPolicy =
       io.oryxos.core.policy.ToolPolicyService.ALLOW_ALL;
+
+  /**
+   * 042 审批策略（事中闸）。默认 {@link io.oryxos.core.policy.ApprovalPolicyService#PASS_THROUGH}；与
+   * PromptBuilder 共用同一实现以保证可见性/执行一致。
+   */
+  private io.oryxos.core.policy.ApprovalPolicyService approvalPolicy =
+      io.oryxos.core.policy.ApprovalPolicyService.PASS_THROUGH;
+
+  /** 043 / #465：耐久挂起；未装配或未启用时 REQUIRE_APPROVAL 仍走 stub 拒绝。 */
+  private DurableTaskService durableTasks;
+
+  /**
+   * 039 / #527：运行时主体裁决。默认 {@link AuthorizationService#ALLOW_ALL}；仅当 {@link PrincipalContext} 有主体时才
+   * decide（CLI/未装载路径零变化）。
+   */
+  private AuthorizationService authorization = AuthorizationService.ALLOW_ALL;
 
   private final ProfileRegistry profileRegistry;
   private final ToolInvocationAuditor auditor;
@@ -54,6 +83,24 @@ public class ToolExecutor {
   public void setToolPolicy(io.oryxos.core.policy.ToolPolicyService toolPolicy) {
     this.toolPolicy =
         toolPolicy == null ? io.oryxos.core.policy.ToolPolicyService.ALLOW_ALL : toolPolicy;
+  }
+
+  /** 装配期注入；未装配保持 PASS_THROUGH。 */
+  public void setApprovalPolicy(io.oryxos.core.policy.ApprovalPolicyService approvalPolicy) {
+    this.approvalPolicy =
+        approvalPolicy == null
+            ? io.oryxos.core.policy.ApprovalPolicyService.PASS_THROUGH
+            : approvalPolicy;
+  }
+
+  /** 装配期注入；未装配则 stub 拒绝路径不变。 */
+  public void setDurableTaskService(DurableTaskService durableTasks) {
+    this.durableTasks = durableTasks;
+  }
+
+  /** 装配期注入同一 {@link AuthorizationService} Bean；未装配保持 ALLOW_ALL。 */
+  public void setAuthorizationService(AuthorizationService authorization) {
+    this.authorization = authorization == null ? AuthorizationService.ALLOW_ALL : authorization;
   }
 
   /** 023 业务指标（装配期注入，setToolPolicy 同款惯例）；未装配保持 NOOP 零破坏。 */
@@ -117,6 +164,11 @@ public class ToolExecutor {
     if (tool == null) {
       return fail(sessionId, agentName, call, "未注册的工具: " + call.name(), startedAt);
     }
+    // 039 / #527：有 PrincipalContext 时复用同一 decide(RUN_AGENT)；无上下文（CLI）跳过。
+    String authzDenied = checkRuntimeAuthorization(agentName);
+    if (authzDenied != null) {
+      return fail(sessionId, agentName, call, authzDenied, AUTHZ_BLOCKED, startedAt);
+    }
     String deniedReason = checkMcpAuthorization(agentName, call.name());
     if (deniedReason != null) {
       return fail(sessionId, agentName, call, deniedReason, startedAt);
@@ -131,6 +183,26 @@ public class ToolExecutor {
           "被平台策略禁止：" + policyDecision.reason(),
           POLICY_BLOCKED,
           startedAt);
+    }
+    // 042/043 审批闸：与 PromptBuilder 同一 ApprovalPolicyService。
+    // 恢复回放：ApprovalGrantContext 命中则跳过闸门。
+    // REQUIRE_APPROVAL + durable-suspend → 真实挂起；否则 stub 拒绝（#464）。
+    if (!ApprovalGrantContext.grants(call.name(), toolCallId)) {
+      var approvalDecision = approvalPolicy.evaluate(agentName, call.name(), call.argumentsJson());
+      if (!approvalDecision.allowed()) {
+        approvalPolicy.recordHit(sessionId, agentName, call.name(), approvalDecision);
+        if (approvalDecision.requiresApproval() && durableTasks != null && durableTasks.enabled()) {
+          throw durableTasks.suspendForApproval(sessionId, agentName, call, approvalDecision);
+        }
+        String prefix = approvalDecision.requiresApproval() ? "需要人工审批：" : "被审批策略拒绝：";
+        return fail(
+            sessionId,
+            agentName,
+            call,
+            prefix + approvalDecision.reason(),
+            APPROVAL_BLOCKED,
+            startedAt);
+      }
     }
     JsonNode input;
     try {
@@ -218,6 +290,24 @@ public class ToolExecutor {
         sanitize(call.name()),
         result.success(),
         System.currentTimeMillis() - startedAt);
+  }
+
+  /**
+   * 运行时主体门禁（#527）：{@link PrincipalContext#current()} 非空时对 Agent 做 {@code
+   * decide(RUN_AGENT)}；空上下文不裁决（CLI / 尚未装载 Principal 的路径保持零变化）。
+   *
+   * @return 拒绝原因；放行返回 {@code null}
+   */
+  private String checkRuntimeAuthorization(String agentName) {
+    Principal principal = PrincipalContext.current();
+    if (principal == null) {
+      return null;
+    }
+    var decision = authorization.decide(principal, Action.RUN_AGENT, ResourceRef.agent(agentName));
+    if (decision.allowed()) {
+      return null;
+    }
+    return "被授权策略拒绝：" + decision.reason();
   }
 
   /**

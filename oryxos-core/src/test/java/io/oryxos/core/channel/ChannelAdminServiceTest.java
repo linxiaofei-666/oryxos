@@ -1,11 +1,13 @@
 package io.oryxos.core.channel;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import io.oryxos.core.policy.AssetGovernance;
 import io.oryxos.core.profile.Profile;
 import io.oryxos.core.profile.ProfileRegistry;
 import java.nio.file.Path;
@@ -183,5 +185,55 @@ class ChannelAdminServiceTest {
     lifecycle.setLength(0);
     admin.stopAll(); // 不抛 NPE
     assertTrue(lifecycle.toString().contains("stop:chan-a"));
+  }
+
+  @Test
+  @DisplayName("update 未携带治理块时保留 channels.yaml 已有块")
+  void updateKeepsGovernanceWhenOmitted() {
+    AssetGovernance block =
+        new AssetGovernance(
+            "alice", "1", AssetGovernance.Visibility.PRIVATE, null, AssetGovernance.Health.ACTIVE);
+    admin.add(config("chan-a", "ops-agent", true).withGovernance(block));
+
+    admin.update("chan-a", config("chan-a", "ops-agent", false));
+
+    AssetGovernance loaded = loader.loadRaw().get(0).governance();
+    assertEquals("alice", loaded.owner());
+    assertEquals(AssetGovernance.Visibility.PRIVATE, loaded.visibility());
+    assertEquals(AssetGovernance.Health.ACTIVE, loaded.health());
+  }
+
+  @Test
+  @DisplayName("updateGovernance 只改治理块且不重建连接")
+  void updateGovernancePersistsWithoutRestart() {
+    admin.add(config("chan-a", "ops-agent", true));
+    lifecycle.setLength(0);
+
+    AssetGovernance offline =
+        new AssetGovernance(
+            "bob",
+            "2",
+            AssetGovernance.Visibility.WORKSPACE,
+            "med",
+            AssetGovernance.Health.OFFLINE);
+    AssetGovernance saved = admin.updateGovernance("chan-a", offline);
+
+    assertEquals(AssetGovernance.Health.OFFLINE, saved.health());
+    assertEquals("bob", loader.loadRaw().get(0).governance().owner());
+    assertTrue(lifecycle.toString().isEmpty(), "治理-only 写不应 stop/start: " + lifecycle);
+  }
+
+  @Test
+  @DisplayName("updateGovernance 空块清除 governance")
+  void updateGovernanceClear() {
+    AssetGovernance block =
+        new AssetGovernance(
+            "alice", "1", AssetGovernance.Visibility.PRIVATE, null, AssetGovernance.Health.ACTIVE);
+    admin.add(config("chan-a", "ops-agent", true).withGovernance(block));
+
+    AssetGovernance cleared = admin.updateGovernance("chan-a", AssetGovernance.empty());
+
+    assertTrue(!cleared.isPresent());
+    assertNull(loader.loadRaw().get(0).governance());
   }
 }

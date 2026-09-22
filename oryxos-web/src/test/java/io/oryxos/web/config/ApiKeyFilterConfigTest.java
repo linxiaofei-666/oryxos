@@ -33,6 +33,9 @@ class ApiKeyFilterConfigTest {
             mock(WebUserService.class),
             new WebApiKeyProperties(),
             new ObjectMapper(),
+            null,
+            null,
+            null,
             null);
 
     assertThat(registration.getUrlPatterns())

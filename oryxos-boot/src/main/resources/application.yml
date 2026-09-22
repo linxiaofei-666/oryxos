@@ -107,6 +107,73 @@ oryxos:
   author:
     provider: deepseek
     model: deepseek-v4-flash
+  # 042 / #464：高风险动作审批策略（HITL）。默认关=零行为变化；开启后按 rules 分类并闸住执行面。
+  # 耐久挂起/恢复见 #465；管理台与 IM 审批交互见 #466。
+  approval:
+    enabled: false
+    # 043 / #465：true 时 REQUIRE_APPROVAL 耐久挂起；默认 false 保持 #464 stub 拒绝
+    durable-suspend: false
+    # 044 / #466：管理台/IM 审批交互 API；默认关 → /api/v1/approvals 404
+    interaction-api-enabled: false
+  # 046 / #468：持久化 Flow 执行引擎。默认关=零行为变化；开启后可 start/resume Markdown Flow。
+  flow:
+    engine-enabled: false
+    compensation-enabled: false
+    default-max-retries: 0
+    policy-version: "1"
+    default-ttl-seconds: 3600
+    default-approvers: []
+    # rules:
+    #   - id: shell-global
+    #     action-types: [SHELL]
+    #     effect: require_approval
+    #     approvers: [admin]
+    #     ttl-seconds: 1800
+  # 049 / #473：Agent/Skill/Knowledge 共享内容版本源（快照 + 原子切换/回滚）。默认关=零行为变化。
+  # 开启后 API：/api/v1/workspace/assets/{kind}/{id}/versions|activate|rollback
+  cluster:
+    versioned-asset-source-enabled: false
+  # 050 / #476: task cost ledger / budget / quotas. Default off.
+  # enabled -> cost_ledger_entries + /api/v1/cost/**; enforcement-enabled -> block/degrade.
+  cost:
+    enabled: false
+    enforcement-enabled: false
+    over-budget-action: block
+    degrade-provider: ""
+    degrade-model: ""
+    default-tool-cost-micros: 0
+    # budgets:
+    #   - id: agent-demo
+    #     scope: agent
+    #     key: demo
+    #     limit-micros: 1000000
+  # 051 / #477: explainable model routing / cost strategy. Default off (gray-release / rollback).
+  # enabled -> strategy + /api/v1/routing/decisions; still limited to Agent primary+fallbacks.
+  routing:
+    enabled: false
+    prefer-cheapest: false
+    max-estimated-cost-micros: 0
+    max-latency-ms: 0
+    decision-log-size: 256
+    # residency-providers: []   # when RoutingContext sensitivity=SENSITIVE, filter to these
+    # difficulty-models:
+    #   low:
+    #     provider: cheap
+    #     model: flash
+    # latency-model:
+    #   provider: cheap
+    #   model: flash
+  # 048 / #472：Agent/Skill/Prompt/Flow 评测与回归门禁。默认关=零行为变化；
+  # CI/发布可用 scripts/eval-regression-gate.sh；开启 gate-enabled 后调用方可比对基线阻断发布。
+  eval:
+    gate-enabled: false
+    min-success-rate: 0.80
+    min-tool-accuracy: 0.80
+    min-citation-quality: 0.70
+    max-latency-ms-avg: 10000
+    max-cost-micros-total: 5000000
+    max-rate-regression: 0.05
+    max-latency-regression-ms: 2000
   # 管理台 Basic Auth（012-web-auth）。默认关=假设内网现状不变（SC-001）；
   # 开启后 /admin/** 需账密，/api/v1/** 不受影响（REST 不做 Basic Auth）。
   # 开启前先 oryxos user add <username> 建账号，否则启动阻断（FR-006）。
@@ -118,6 +185,16 @@ oryxos:
     oidc:
       enabled: false
       scopes: openid profile email
+      # group-roles 为空则不改角色。非空时命中才 setRoles；未命中默认不撤权。
+      # revoke-unmatched-roles: false   # true 时 group-roles 已配但零命中 → 清空 roles
+      # jit-provision-enabled: false    # true 时未映射 subject 按 preferred_username/email 建用户+mapping
+      # jit-team-catalog-enabled: false # true 时登录按 groups 幂等写 teams 目录行（display_name=id）
+      # jit-team-memberships-enabled: false # true 时登录按 groups 幂等写 team_memberships（无 catalog 行则跳过）
+      # revoke-unmatched-team-memberships: false # true 时（须 JIT memberships）移除不在期望集中的成员；空 groups → 清空
+      # org-ids-claim: "" # 非空=读 id_token claim → session orgIds（#590）
+      # jit-org-catalog-enabled: false # true 且 org-ids-claim 非空时，登录按 claim org ids 幂等写 organizations（#592）
+      # group-claim: groups
+      # group-roles: {}
 
 # Observability: Actuator + Micrometer/Prometheus
 # /actuator/** 由 ApiKeyAuthFilter 保护（API Key 或管理台 session），health 探活子树豁免；
@@ -135,7 +212,7 @@ management:
       # 半死副本仍显示就绪）。liveness 保持仅状态位（DB 抖动不该触发重启）。
       group:
         readiness:
-          include: readinessState,db
+          include: readinessState,db,workspace
       # 匿名探活只看聚合 UP/DOWN；组件/数据源/磁盘等详情需认证（when-authorized）
       show-details: when-authorized
       show-components: when-authorized

@@ -1,5 +1,6 @@
 package io.oryxos.core.channel;
 
+import io.oryxos.core.policy.AssetGovernance;
 import io.oryxos.core.profile.ProfileRegistry;
 import java.util.ArrayList;
 import java.util.List;
@@ -95,15 +96,37 @@ public class ChannelAdminService {
     if (idx < 0) {
       throw new IllegalArgumentException("渠道不存在: " + name);
     }
-    ChannelConfig resolved = loader.resolve(raw);
-    if (raw.enabled()) {
+    ChannelConfig merged = preserveGovernance(raw, existing.get(idx));
+    ChannelConfig resolved = loader.resolve(merged);
+    if (merged.enabled()) {
       validateForLaunch(resolved);
     }
     stopOne(name);
-    existing.set(idx, raw);
+    existing.set(idx, merged);
     loader.save(existing);
     startOne(resolved);
-    return raw;
+    return merged;
+  }
+
+  /** 更新未携带治理块时保留既有块，避免 CRUD 把 channels.yaml 里的 governance 抹掉。显式空块表示清除。 */
+  private static ChannelConfig preserveGovernance(ChannelConfig incoming, ChannelConfig previous) {
+    if (incoming.governance() != null) {
+      return incoming;
+    }
+    return incoming.withGovernance(previous.governance());
+  }
+
+  /** 只改 channels.yaml 的 {@code governance:} 块并落盘，不断开/重建连接（入站 OFFLINE 门禁读盘，不依赖适配器热更）。 空治理 = 清除块。 */
+  public synchronized AssetGovernance updateGovernance(String name, AssetGovernance governance) {
+    List<ChannelConfig> existing = new ArrayList<>(loader.loadRaw());
+    int idx = indexOf(existing, name);
+    if (idx < 0) {
+      throw new IllegalArgumentException("渠道不存在: " + name);
+    }
+    AssetGovernance block = governance == null || !governance.isPresent() ? null : governance;
+    existing.set(idx, existing.get(idx).withGovernance(block));
+    loader.save(existing);
+    return block == null ? AssetGovernance.empty() : block;
   }
 
   /** 删除渠道：断开连接并从配置移除。 */

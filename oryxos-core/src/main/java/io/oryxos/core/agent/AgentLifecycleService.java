@@ -17,6 +17,7 @@ import io.oryxos.core.skill.SkillCatalogEntry;
 import io.oryxos.core.skill.SkillRegistry;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Comparator;
@@ -25,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.yaml.snakeyaml.DumperOptions;
 import org.yaml.snakeyaml.DumperOptions.FlowStyle;
@@ -48,6 +50,8 @@ public class AgentLifecycleService {
       org.slf4j.LoggerFactory.getLogger(AgentLifecycleService.class);
 
   private static final String PARENT_PATH_SEGMENT = "..";
+  private static final String AGENT_NAME_PATTERN = "[A-Za-z0-9_-]+";
+  private static final String AGENT_DEFINITION_FILE = "AGENT.md";
 
   /** 025：AGENT.md frontmatter 里人格段的键。 */
   private static final String PERSONA_KEY = "persona";
@@ -475,17 +479,20 @@ public class AgentLifecycleService {
   public synchronized void reconcileAll() {
     java.nio.file.Path agentsDir = agentStore.agentsDir();
     Set<String> onDisk = new java.util.LinkedHashSet<>();
-    if (java.nio.file.Files.isDirectory(agentsDir)) {
+    if (existingDirectory(agentsDir)) {
       try (java.util.stream.Stream<Path> dirs = java.nio.file.Files.list(agentsDir)) {
-        dirs.filter(dir -> java.nio.file.Files.isDirectory(dir))
-            .filter(dir -> java.nio.file.Files.isRegularFile(dir.resolve("AGENT.md")))
+        dirs.filter(AgentLifecycleService::existingDirectory)
+            .filter(dir -> existingRegularFile(dir.resolve("AGENT.md")))
             .sorted()
             .forEach(
                 dir -> {
                   onDisk.add(String.valueOf(dir.getFileName()));
                   try {
                     refresh(dir);
+                  } catch (UncheckedIOException unavailable) {
+                    throw unavailable;
                   } catch (RuntimeException e) {
+                    existingDirectory(agentsDir);
                     LOG.error(
                         "对账时跳过损坏的 Agent 目录 {}: {}",
                         sanitize(String.valueOf(dir.getFileName())),
@@ -493,14 +500,33 @@ public class AgentLifecycleService {
                   }
                 });
       } catch (IOException e) {
-        LOG.error("扫描 agents 目录失败，保留现有注册表: {}", sanitize(e.getMessage()));
-        return; // 盘不可读时不做「消失即注销」——避免共享卷抖动清空注册表（spec Edge Case）
+        throw new UncheckedIOException("扫描 agents 目录失败，保留现有注册表", e);
       }
     }
     for (Profile profile : List.copyOf(profileRegistry.all())) {
       if (!onDisk.contains(profile.name())) {
         unregisterByDir(agentsDir.resolve(profile.name()));
       }
+    }
+  }
+
+  private static boolean existingDirectory(Path path) {
+    return existingType(path, true);
+  }
+
+  private static boolean existingRegularFile(Path path) {
+    return existingType(path, false);
+  }
+
+  private static boolean existingType(Path path, boolean directory) {
+    try {
+      java.nio.file.attribute.BasicFileAttributes attributes =
+          Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class);
+      return directory ? attributes.isDirectory() : attributes.isRegularFile();
+    } catch (java.nio.file.NoSuchFileException missing) {
+      return false;
+    } catch (IOException failure) {
+      throw new UncheckedIOException("读取工作区目录项失败: " + path, failure);
     }
   }
 
@@ -512,6 +538,27 @@ public class AgentLifecycleService {
     String name = String.valueOf(agentDir.getFileName());
     profileRegistry.get(name).ifPresent(agentScheduler::unregisterProfile);
     return register(agentDir);
+  }
+
+  /** Canonical management read; does not replace the runtime registry or reschedule jobs. */
+  public Optional<Profile> getCurrent(String name) {
+    if (name == null || !name.matches(AGENT_NAME_PATTERN)) {
+      throw new IllegalArgumentException("Invalid Agent name");
+    }
+    Path directory = agentStore.agentsDir().resolve(name);
+    if (!Files.isRegularFile(directory.resolve(AGENT_DEFINITION_FILE))) {
+      return Optional.empty();
+    }
+    io.oryxos.core.fs.RealPathBoundary.requireWithin(agentStore.agentsDir(), directory);
+    try {
+      return Optional.of(agentLoader.deriveProfile(directory));
+    } catch (IOException failure) {
+      throw new java.io.UncheckedIOException("Cannot read canonical Agent definition", failure);
+    }
+  }
+
+  public Collection<Profile> listCurrent() {
+    return agentLoader.loadAll().all();
   }
 
   public Optional<Profile> get(String name) {
@@ -724,6 +771,35 @@ public class AgentLifecycleService {
       List<String> requiredSkills,
       String provider,
       String model) {
+    return generateDraft(
+        name, description, notifyChannel, requiredSkills, provider, model, null, null);
+  }
+
+  /**
+   * 生成草稿；{@code skillVisible} 非空时只把通过可见性谓词的已安装 Skill 注入提示词与 required 校验（Web 侧接 GOVERNANCE 列表门禁）。
+   */
+  public GeneratedAgentDraft generateDraft(
+      String name,
+      String description,
+      String notifyChannel,
+      List<String> requiredSkills,
+      String provider,
+      String model,
+      Predicate<String> skillVisible) {
+    return generateDraft(
+        name, description, notifyChannel, requiredSkills, provider, model, skillVisible, null);
+  }
+
+  /** 生成草稿；{@code knowledgeVisible} 非空时只把可见知识库注入提示词（与 Skill GOVERNANCE 列表门禁同口径）。 */
+  public GeneratedAgentDraft generateDraft(
+      String name,
+      String description,
+      String notifyChannel,
+      List<String> requiredSkills,
+      String provider,
+      String model,
+      Predicate<String> skillVisible,
+      Predicate<String> knowledgeVisible) {
     String genProvider =
         authorProvider == null || authorProvider.isBlank()
             ? (defaultProvider == null || defaultProvider.isBlank() ? "deepseek" : defaultProvider)
@@ -738,7 +814,7 @@ public class AgentLifecycleService {
       throw new IllegalArgumentException("通知渠道不存在: " + channel);
     }
     // 用户显式指定的 Skill（"启用哪个 Skill"也是人的决定）：校验确实存在于全局库
-    List<SkillCatalogEntry> candidates = availableCatalogCandidates();
+    List<SkillCatalogEntry> candidates = availableCatalogCandidates(skillVisible);
     Set<String> candidateNames =
         candidates.stream().map(SkillCatalogEntry::name).collect(Collectors.toSet());
     List<String> required = normalizedSkills(requiredSkills);
@@ -768,6 +844,16 @@ public class AgentLifecycleService {
             Profile.Settings.defaults());
     Map<String, String> knowledgeBases =
         knowledgeCandidates == null ? Map.of() : knowledgeCandidates.get();
+    if (knowledgeVisible != null && !knowledgeBases.isEmpty()) {
+      Map<String, String> filtered = new LinkedHashMap<>();
+      knowledgeBases.forEach(
+          (kb, descriptionText) -> {
+            if (knowledgeVisible.test(kb)) {
+              filtered.put(kb, descriptionText);
+            }
+          });
+      knowledgeBases = filtered;
+    }
     String prompt =
         AGENT_AUTHOR_PROMPT
                 .replace("{name}", name)
@@ -870,13 +956,23 @@ public class AgentLifecycleService {
   }
 
   public Profile saveFiles(String name, Map<String, String> files, List<String> bindingSkills) {
+    return saveFiles(name, files, bindingSkills, null);
+  }
+
+  /** 保存 Agent 文件；{@code skillVisible} 非空时绑定名单只允许可见的已安装 catalog 项（与 Web GOVERNANCE 列表门禁对齐）。 */
+  public Profile saveFiles(
+      String name,
+      Map<String, String> files,
+      List<String> bindingSkills,
+      Predicate<String> skillVisible) {
     String agentMarkdown = files == null ? null : files.get("AGENT.md");
     if (agentMarkdown == null || agentMarkdown.isBlank()) {
       throw new IllegalArgumentException("缺少 AGENT.md 内容");
     }
     rejectLegacySkills(agentMarkdown);
     agentLoader.parse(agentMarkdown, name); // 先校验再落盘：非法定义不写进目录
-    List<String> validated = bindingSkills == null ? null : validateBindable(bindingSkills);
+    List<String> validated =
+        bindingSkills == null ? null : validateBindable(bindingSkills, skillVisible);
     Profile old = profileRegistry.get(name).orElse(null);
     if (validated != null && skillBindings == null) {
       throw new IllegalStateException("Agent Skill 绑定服务未装配");
@@ -1020,13 +1116,16 @@ public class AgentLifecycleService {
         .collect(Collectors.joining("\n"));
   }
 
-  private List<SkillCatalogEntry> availableCatalogCandidates() {
+  private List<SkillCatalogEntry> availableCatalogCandidates(Predicate<String> skillVisible) {
     if (skillCatalog == null || skillRegistry == null) {
       return List.of();
     }
     List<SkillCatalogEntry> entries = skillCatalog.query("", null);
     Map<String, SkillCatalogEntry> unique = new LinkedHashMap<>();
     for (SkillCatalogEntry entry : entries) {
+      if (skillVisible != null && !skillVisible.test(entry.name())) {
+        continue;
+      }
       if (unique.putIfAbsent(entry.name(), entry) != null) {
         throw new IllegalStateException("Skill catalog 存在同名公共/私有冲突: " + entry.name());
       }
@@ -1038,9 +1137,13 @@ public class AgentLifecycleService {
   }
 
   private List<String> validateBindable(List<String> names) {
+    return validateBindable(names, null);
+  }
+
+  private List<String> validateBindable(List<String> names, Predicate<String> skillVisible) {
     List<String> normalized = normalizedSkills(names);
     Set<String> available =
-        availableCatalogCandidates().stream()
+        availableCatalogCandidates(skillVisible).stream()
             .map(SkillCatalogEntry::name)
             .collect(Collectors.toSet());
     for (String name : normalized) {

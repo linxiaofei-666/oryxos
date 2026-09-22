@@ -22,11 +22,14 @@
     <properties>
         <java.version>21</java.version>
         <spring-ai.version>1.1.8</spring-ai.version>
-        <picocli.version>4.7.6</picocli.version>
-        <sqlite-jdbc.version>3.53.2.1</sqlite-jdbc.version>
+        <picocli.version>4.7.7</picocli.version>
+        <sqlite-jdbc.version>3.53.4.0</sqlite-jdbc.version>
         <!-- 025：覆盖 Boot BOM 的 42.7.11——CVE-2026-54291（CVSS 8.2）修复于 42.7.12（OSV 实证），OWASP 门禁线 8.0 -->
         <postgresql.version>42.7.12</postgresql.version>
         <pdfbox.version>3.0.8</pdfbox.version>
+        <poi.version>5.5.1</poi.version>
+        <commons-io.version>2.22.0</commons-io.version>
+        <commons-compress.version>1.28.0</commons-compress.version>
         <oapi-sdk.version>2.8.5</oapi-sdk.version>
 
         <!-- Infrastructure libraries -->
@@ -41,19 +44,25 @@
         <!-- Boot 3.5.x line; 2.9+/3.x need Boot 4 -->
         <springdoc.version>2.8.17</springdoc.version>
         <!-- springdoc 2.8.17 still ships older swagger-ui; override for DOMPurify CVEs -->
-        <swagger-ui.version>5.32.13</swagger-ui.version>
+        <swagger-ui.version>5.32.15</swagger-ui.version>
 
         <!-- Quality / format / security plugins -->
-        <spotless.version>2.43.0</spotless.version>
-        <maven-pmd-plugin.version>3.21.2</maven-pmd-plugin.version>
-        <pmd.version>6.55.0</pmd.version>
-        <p3c.version>2.1.1</p3c.version>
-        <maven-checkstyle-plugin.version>3.5.0</maven-checkstyle-plugin.version>
-        <checkstyle.version>10.18.2</checkstyle.version>
-        <spotbugs-maven-plugin.version>4.8.6.4</spotbugs-maven-plugin.version>
-        <spotbugs.version>4.8.6</spotbugs.version>
-        <findsecbugs.version>1.13.0</findsecbugs.version>
-        <dependency-check.version>12.2.2</dependency-check.version>
+        <spotless.version>3.10.2</spotless.version>
+        <!-- PMD 7 requires maven-pmd-plugin 3.22+; 3.28 ships 7.17, we override to 7.27. -->
+        <maven-pmd-plugin.version>3.28.0</maven-pmd-plugin.version>
+        <pmd.version>7.27.0</pmd.version>
+        <maven-checkstyle-plugin.version>3.6.0</maven-checkstyle-plugin.version>
+        <checkstyle.version>14.1.0</checkstyle.version>
+        <spotbugs-maven-plugin.version>4.10.4.1</spotbugs-maven-plugin.version>
+        <spotbugs.version>4.10.4</spotbugs.version>
+        <findsecbugs.version>1.14.0</findsecbugs.version>
+        <dependency-check.version>13.0.0</dependency-check.version>
+        <!-- #453：CycloneDX SBOM；CI 显式调用 makeAggregateBom，不绑 package 以免拖慢本地 verify -->
+        <cyclonedx-maven-plugin.version>2.9.3</cyclonedx-maven-plugin.version>
+        <!-- #453：JaCoCo UT coverage; LINE COVEREDRATIO gate (aggregate report on boot) -->
+        <jacoco.version>0.8.15</jacoco.version>
+        <!-- Tip measured aggregate LINE ~66.93% (2026-09-21); floor slightly below. Override: -Djacoco.line.coverage.minimum= -->
+        <jacoco.line.coverage.minimum>0.65</jacoco.line.coverage.minimum>
         <nvd.datafeed.url>https://dependency-check.github.io/DependencyCheck_Builder/nvd_cache/</nvd.datafeed.url>
 
         <!-- OWASP Dependency-Check is skipped by default for fast local builds and enabled in CI. -->
@@ -105,11 +114,23 @@
                 <scope>import</scope>
             </dependency>
 
+            <!-- OWASP 钉版（2026-09 波次）：传递依赖里的 commons-compress/io 升到修复版 -->
+            <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-compress</artifactId>
+                <version>${commons-compress.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-io</groupId>
+                <artifactId>commons-io</artifactId>
+                <version>${commons-io.version}</version>
+            </dependency>
+
             <!-- 039：OpenTelemetry BOM——trace 导出（SpanRecorder 的装配层实现），版本统一由 BOM 管理 -->
             <dependency>
                 <groupId>io.opentelemetry</groupId>
                 <artifactId>opentelemetry-bom</artifactId>
-                <version>1.44.1</version>
+                <version>1.66.0</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -136,7 +157,7 @@
             <dependency>
                 <groupId>com.squareup.okio</groupId>
                 <artifactId>okio</artifactId>
-                <version>3.9.1</version>
+                <version>3.18.2</version>
             </dependency>
 
             <!-- Internal modules -->
@@ -306,7 +327,7 @@
             <dependency>
                 <groupId>com.github.spotbugs</groupId>
                 <artifactId>spotbugs-annotations</artifactId>
-                <version>4.8.6</version>
+                <version>4.10.4</version>
                 <scope>provided</scope>
             </dependency>
 
@@ -339,7 +360,7 @@
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-enforcer-plugin</artifactId>
-                    <version>3.5.0</version>
+                    <version>3.6.3</version>
                     <executions>
                         <execution>
                             <id>enforce-environment</id>
@@ -402,40 +423,22 @@
                     </executions>
                 </plugin>
 
-                <!-- Coding rules: Alibaba P3C on top of PMD (PMD 6.x for P3C compatibility) -->
+                <!-- Coding rules: stock PMD 7 (p3c-pmd is PMD 6-only; dropped in #518). -->
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-pmd-plugin</artifactId>
                     <version>${maven-pmd-plugin.version}</version>
                     <configuration>
-                        <!-- PMD 6.55 (newest that P3C 2.1.1 supports) tops out at Java 19,
-                             so parse at the 17 grammar level. Code must avoid Java 18-21
-                             *syntax* (record patterns, pattern switch); records/sealed are fine. -->
-                        <targetJdk>17</targetJdk>
+                        <targetJdk>${java.version}</targetJdk>
                         <printFailingErrors>true</printFailingErrors>
                         <skipPmdError>false</skipPmdError>
                         <linkXRef>false</linkXRef>
                         <analysisCache>true</analysisCache>
                         <rulesets>
-                            <ruleset>rulesets/java/ali-naming.xml</ruleset>
-                            <ruleset>rulesets/java/ali-oop.xml</ruleset>
-                            <ruleset>rulesets/java/ali-concurrent.xml</ruleset>
-                            <ruleset>rulesets/java/ali-exception.xml</ruleset>
-                            <ruleset>rulesets/java/ali-constant.xml</ruleset>
-                            <ruleset>rulesets/java/ali-flowcontrol.xml</ruleset>
-                            <ruleset>rulesets/java/ali-set.xml</ruleset>
-                            <ruleset>rulesets/java/ali-other.xml</ruleset>
+                            <ruleset>${maven.multiModuleProjectDirectory}/config/pmd-ruleset.xml</ruleset>
                         </rulesets>
                     </configuration>
                     <dependencies>
-                        <!-- Upgrade ASM ahead of PMD 6.55's bundled copy: the old one throws
-                             "Unsupported class file major version 65" when type resolution reads
-                             Java 21 bytecode on the auxclasspath. ASM 9.7 understands class v65. -->
-                        <dependency>
-                            <groupId>org.ow2.asm</groupId>
-                            <artifactId>asm</artifactId>
-                            <version>9.7</version>
-                        </dependency>
                         <dependency>
                             <groupId>net.sourceforge.pmd</groupId>
                             <artifactId>pmd-core</artifactId>
@@ -445,11 +448,6 @@
                             <groupId>net.sourceforge.pmd</groupId>
                             <artifactId>pmd-java</artifactId>
                             <version>${pmd.version}</version>
-                        </dependency>
-                        <dependency>
-                            <groupId>com.alibaba.p3c</groupId>
-                            <artifactId>p3c-pmd</artifactId>
-                            <version>${p3c.version}</version>
                         </dependency>
                     </dependencies>
                     <executions>
@@ -498,6 +496,7 @@
                     <configuration>
                         <effort>Max</effort>
                         <threshold>Low</threshold>
+                        <excludeFilterFile>${maven.multiModuleProjectDirectory}/config/spotbugs-exclude.xml</excludeFilterFile>
                         <plugins>
                             <plugin>
                                 <groupId>com.h3xstream.findsecbugs</groupId>
@@ -520,6 +519,49 @@
                             </goals>
                         </execution>
                     </executions>
+                </plugin>
+
+
+                <!-- #453：JaCoCo — instrument Surefire UTs + per-module report.
+                     Aggregate HTML/XML + jacoco:check LINE gate live on oryxos-boot
+                     (per-module check at aggregate floor would fail sparse channel modules). -->
+                <plugin>
+                    <groupId>org.jacoco</groupId>
+                    <artifactId>jacoco-maven-plugin</artifactId>
+                    <version>${jacoco.version}</version>
+                    <executions>
+                        <execution>
+                            <id>jacoco-prepare-agent</id>
+                            <goals>
+                                <goal>prepare-agent</goal>
+                            </goals>
+                        </execution>
+                        <execution>
+                            <id>jacoco-report</id>
+                            <phase>verify</phase>
+                            <goals>
+                                <goal>report</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
+                <!-- #453：CycloneDX aggregate SBOM（CI 调用 makeAggregateBom；不绑定生命周期） -->
+                <plugin>
+                    <groupId>org.cyclonedx</groupId>
+                    <artifactId>cyclonedx-maven-plugin</artifactId>
+                    <version>${cyclonedx-maven-plugin.version}</version>
+                    <configuration>
+                        <projectType>application</projectType>
+                        <schemaVersion>1.6</schemaVersion>
+                        <includeBomSerialNumber>true</includeBomSerialNumber>
+                        <includeCompileScope>true</includeCompileScope>
+                        <includeProvidedScope>true</includeProvidedScope>
+                        <includeRuntimeScope>true</includeRuntimeScope>
+                        <includeSystemScope>true</includeSystemScope>
+                        <includeTestScope>false</includeTestScope>
+                        <outputReactorProjects>false</outputReactorProjects>
+                        <outputFormat>all</outputFormat>
+                    </configuration>
                 </plugin>
 
                 <!-- Security: OWASP Dependency-Check (CVE scan of third-party deps) -->
@@ -553,6 +595,10 @@
 
         <plugins>
             <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+            </plugin>
+            <plugin>
                 <groupId>com.diffplug.spotless</groupId>
                 <artifactId>spotless-maven-plugin</artifactId>
             </plugin>
@@ -571,6 +617,10 @@
             <plugin>
                 <groupId>org.owasp</groupId>
                 <artifactId>dependency-check-maven</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
             </plugin>
         </plugins>
     </build>

@@ -18,6 +18,8 @@ class RequestActionResolverTest {
     assertSkip("GET", "/actuator/health");
     assertSkip("GET", "/actuator/health/liveness");
     assertSkip("POST", "/api/v1/channels/inbound/feishu");
+    assertSkip("POST", "/api/v1/approvals/callbacks/feishu");
+    assertSkip("POST", "/api/v1/approvals/callbacks/wecom");
     assertSkip("POST", "/api/v1");
     assertSkip("POST", "/api/v1/");
   }
@@ -35,6 +37,8 @@ class RequestActionResolverTest {
   void policiesAndProfiles() {
     assertAction("GET", "/api/v1/tool-policy/rules", Action.MANAGE_POLICIES);
     assertAction("PUT", "/api/v1/sandbox/whitelist", Action.MANAGE_POLICIES);
+    assertAction("GET", "/api/v1/approvals", Action.MANAGE_POLICIES);
+    assertAction("POST", "/api/v1/approvals/cp-1/decide", Action.MANAGE_POLICIES);
     assertAction("GET", "/api/v1/profiles", Action.READ_WORKSPACE);
   }
 
@@ -44,6 +48,27 @@ class RequestActionResolverTest {
     assertAction("GET", "/api/v2/schedules", Action.READ_WORKSPACE);
     assertAction("POST", "/api/v2/schedules", Action.MANAGE_AGENTS);
     assertAction("POST", "/api/v2/agents/demo/schedules/nightly/run", Action.MANAGE_AGENTS);
+  }
+
+  @Test
+  @DisplayName("teams / orgs / user-teams / identity-mappings → MANAGE_MEMBERS（含 GET，ADMIN 门）")
+  void teamsApi() {
+    assertAction("GET", "/api/v1/teams", Action.MANAGE_MEMBERS);
+    assertAction("POST", "/api/v1/teams", Action.MANAGE_MEMBERS);
+    assertAction("PATCH", "/api/v1/teams/eng", Action.MANAGE_MEMBERS);
+    assertAction("PUT", "/api/v1/teams/eng/org", Action.MANAGE_MEMBERS);
+    assertAction("DELETE", "/api/v1/teams/eng", Action.MANAGE_MEMBERS);
+    assertAction("GET", "/api/v1/orgs", Action.MANAGE_MEMBERS);
+    assertAction("POST", "/api/v1/orgs", Action.MANAGE_MEMBERS);
+    assertAction("PATCH", "/api/v1/orgs/acme", Action.MANAGE_MEMBERS);
+    assertAction("DELETE", "/api/v1/orgs/acme", Action.MANAGE_MEMBERS);
+    assertAction("PUT", "/api/v1/orgs/acme/parent", Action.MANAGE_MEMBERS);
+    assertAction("GET", "/api/v1/users/alice/teams", Action.MANAGE_MEMBERS);
+    assertAction("PUT", "/api/v1/users/alice/teams/eng", Action.MANAGE_MEMBERS);
+    assertAction("DELETE", "/api/v1/users/alice/teams/eng", Action.MANAGE_MEMBERS);
+    assertAction("GET", "/api/v1/identity-mappings", Action.MANAGE_MEMBERS);
+    assertAction("POST", "/api/v1/identity-mappings", Action.MANAGE_MEMBERS);
+    assertAction("DELETE", "/api/v1/identity-mappings", Action.MANAGE_MEMBERS);
   }
 
   @Test

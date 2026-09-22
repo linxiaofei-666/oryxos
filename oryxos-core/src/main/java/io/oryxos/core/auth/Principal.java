@@ -2,6 +2,7 @@ package io.oryxos.core.auth;
 
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Set;
 
@@ -24,6 +25,12 @@ import java.util.Set;
  * <p>为什么用不可变 record：主体在一条请求的处理链路上会被 Filter、Controller、授权决策点多方读取，
  * 可变对象会带来「谁在什么时机改了角色」的排查成本。角色集合在构造时去重并冻结。
  *
+ * <p>{@code teamIds}（041 / #504 / #535）：请求期团队声明，供 WORKSPACE+{@code teamOwner} 门禁；可来自 session
+ * 缓存与（可选）持久化 {@code team_memberships}；不进角色矩阵。空 = 未声明。
+ *
+ * <p>{@code orgIds}（041 / #560）：请求期组织声明，供 WORKSPACE+{@code orgOwner} 门禁；可来自 session 缓存（由 {@code
+ * teamIds} × {@code teams.org_id} 派生）；不进角色矩阵。空 = 未声明（门禁可回退到即时 team×lookup）。
+ *
  * <p>线程/请求边界：主体<b>不放在全局静态变量</b>里。servlet 容器会复用工作线程，Web 侧务必用请求属性 携带（见 oryxos-web 的请求属性承载），工具执行链路继续沿用
  * {@link io.oryxos.core.agent.ToolExecutionContext} 既有的 ThreadLocal 纪律。
  *
@@ -31,8 +38,16 @@ import java.util.Set;
  * @param id 主体标识：USER 为用户名，API_KEY 为 Key 名称，ANONYMOUS 为固定占位
  * @param displayName 展示名，仅用于审计与界面；不参与任何裁决
  * @param roles 该主体持有的角色集合；构造时去重并冻结为不可变集合
+ * @param teamIds 团队 id 集合（常来自 OIDC groups）；构造时去空白并冻结
+ * @param orgIds 组织 id 集合（常来自 teams.org_id）；构造时去空白并冻结
  */
-public record Principal(Kind kind, String id, String displayName, Set<Role> roles) {
+public record Principal(
+    Kind kind,
+    String id,
+    String displayName,
+    Set<Role> roles,
+    Set<String> teamIds,
+    Set<String> orgIds) {
 
   /** 匿名主体的固定标识（审计里统一出现这一个值，便于聚合「未认证访问」）。 */
   public static final String ANONYMOUS_ID = "anonymous";
@@ -50,39 +65,75 @@ public record Principal(Kind kind, String id, String displayName, Set<Role> role
     ANONYMOUS
   }
 
-  /** 紧凑构造器：归一 null 并冻结角色集合，保证 record 真正不可变。 */
+  /** 紧凑构造器：归一 null 并冻结角色 / 团队 / 组织集合，保证 record 真正不可变。 */
   public Principal {
     kind = kind == null ? Kind.ANONYMOUS : kind;
     roles =
         roles == null || roles.isEmpty()
             ? Set.of()
             : Collections.unmodifiableSet(EnumSet.copyOf(roles));
+    teamIds = freezeIds(teamIds);
+    orgIds = freezeIds(orgIds);
   }
 
-  /** 管理台账号主体。 */
+  /** 兼容旧 4 参构造：无团队 / 组织声明。 */
+  public Principal(Kind kind, String id, String displayName, Set<Role> roles) {
+    this(kind, id, displayName, roles, Set.of(), Set.of());
+  }
+
+  /** 兼容 5 参构造：有团队、无组织声明。 */
+  public Principal(Kind kind, String id, String displayName, Set<Role> roles, Set<String> teamIds) {
+    this(kind, id, displayName, roles, teamIds, Set.of());
+  }
+
+  /** 管理台账号主体（无团队 / 组织）。 */
   public static Principal user(String id, String displayName, Set<Role> roles) {
-    return new Principal(Kind.USER, id, displayName, roles);
+    return user(id, displayName, roles, Set.of(), Set.of());
+  }
+
+  /** 管理台账号主体（带团队声明）。 */
+  public static Principal user(
+      String id, String displayName, Set<Role> roles, Set<String> teamIds) {
+    return user(id, displayName, roles, teamIds, Set.of());
+  }
+
+  /** 管理台账号主体（带团队与组织声明）。 */
+  public static Principal user(
+      String id, String displayName, Set<Role> roles, Set<String> teamIds, Set<String> orgIds) {
+    return new Principal(Kind.USER, id, displayName, roles, teamIds, orgIds);
   }
 
   /** API Key 调用方主体（无角色 = 该 Key 未被授予任何角色，裁决时一律拒绝）。 */
   public static Principal apiKey(String keyName, String displayName) {
-    return new Principal(Kind.API_KEY, keyName, displayName, Set.of());
+    return new Principal(Kind.API_KEY, keyName, displayName, Set.of(), Set.of(), Set.of());
   }
 
   /** API Key 调用方主体：显式授予角色（权限来源是 Key 上的授权，不是操作者身份）。 */
   public static Principal apiKey(String keyName, String displayName, Set<Role> roles) {
-    return new Principal(Kind.API_KEY, keyName, displayName, roles);
+    return new Principal(Kind.API_KEY, keyName, displayName, roles, Set.of(), Set.of());
   }
 
   /** 未认证主体（仅此一个语义，不携带任何角色）。 */
   public static Principal anonymous() {
-    return new Principal(Kind.ANONYMOUS, ANONYMOUS_ID, ANONYMOUS_ID, Set.of());
+    return new Principal(Kind.ANONYMOUS, ANONYMOUS_ID, ANONYMOUS_ID, Set.of(), Set.of(), Set.of());
   }
 
-  /** 角色视图：每次返回防御性副本，避免 SpotBugs EI_EXPOSE_REP（即便字段已是不可变包装，accessor 直接返回字段引用仍会被判定）。 */
+  /** 角色视图：每次返回防御性副本，避免 SpotBugs EI_EXPOSE_REP。 */
   @Override
   public Set<Role> roles() {
     return roles.isEmpty() ? Set.of() : Set.copyOf(roles);
+  }
+
+  /** 团队视图：每次返回防御性副本。 */
+  @Override
+  public Set<String> teamIds() {
+    return teamIds.isEmpty() ? Set.of() : Set.copyOf(teamIds);
+  }
+
+  /** 组织视图：每次返回防御性副本。 */
+  @Override
+  public Set<String> orgIds() {
+    return orgIds.isEmpty() ? Set.of() : Set.copyOf(orgIds);
   }
 
   /** 是否未认证主体。 */
@@ -93,6 +144,16 @@ public record Principal(Kind kind, String id, String displayName, Set<Role> role
   /** 是否持有指定角色。 */
   public boolean hasRole(Role role) {
     return role != null && roles.contains(role);
+  }
+
+  /** 是否声明了指定团队 id（大小写敏感，与 IdP group 字面量对齐）。 */
+  public boolean hasTeam(String teamId) {
+    return teamId != null && !teamId.isBlank() && teamIds.contains(teamId.strip());
+  }
+
+  /** 是否声明了指定组织 id（大小写敏感，与 {@code teams.org_id} / orgOwner 字面量对齐）。 */
+  public boolean hasOrg(String orgId) {
+    return orgId != null && !orgId.isBlank() && orgIds.contains(orgId.strip());
   }
 
   /**
@@ -107,5 +168,19 @@ public record Principal(Kind kind, String id, String displayName, Set<Role> role
   /** 审计友好的一行描述（不含任何凭证；API Key 只出现名称，绝不出现明文）。 */
   public String describe() {
     return kind + ":" + Objects.toString(id, "?");
+  }
+
+  private static Set<String> freezeIds(Set<String> raw) {
+    if (raw == null || raw.isEmpty()) {
+      return Set.of();
+    }
+    Set<String> cleaned = new LinkedHashSet<>();
+    for (String id : raw) {
+      if (id == null || id.isBlank()) {
+        continue;
+      }
+      cleaned.add(id.strip());
+    }
+    return cleaned.isEmpty() ? Set.of() : Collections.unmodifiableSet(cleaned);
   }
 }

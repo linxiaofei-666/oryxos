@@ -179,6 +179,11 @@ import org.springframework.web.context.WebApplicationContext;
   SmtpSandboxProperties.class,
   ExecutionBackendProperties.class,
   io.oryxos.core.cluster.ClusterProperties.class,
+  io.oryxos.core.policy.ApprovalPolicyProperties.class,
+  io.oryxos.core.flow.FlowEngineProperties.class,
+  io.oryxos.core.eval.EvalProperties.class,
+  io.oryxos.core.cost.CostProperties.class,
+  io.oryxos.core.routing.RoutingProperties.class,
   OtelProperties.class
 })
 public class OryxOsRuntime {
@@ -189,11 +194,19 @@ public class OryxOsRuntime {
   // 工作区根目录默认 ./.oryxos；可用属性 oryxos.root 覆盖（集成测试指向临时工作区，默认行为不变）。
   // 从 Spring Environment 解析（而非 JVM 静态捕获 System property）：使每个上下文各持自己的根，
   // 支持同一 JVM 内多套 hermetic 测试上下文并存（各自的 @DynamicPropertySource / SpringApplicationBuilder 根互不干扰）。
-  @Value("${oryxos.root:.oryxos}")
-  private String oryxosRootProp;
+  @org.springframework.beans.factory.annotation.Autowired
+  private io.oryxos.core.workspace.WorkspaceStorage workspaceStorage;
 
   private Path oryxosRoot() {
-    return Path.of(oryxosRootProp);
+    return workspaceStorage.root();
+  }
+
+  private Path nativeWorkspaceRoot() {
+    try {
+      return workspaceStorage.nativePath(workspaceStorage.root());
+    } catch (java.io.IOException failure) {
+      throw new java.io.UncheckedIOException("Workspace execution view unavailable", failure);
+    }
   }
 
   @Bean
@@ -221,13 +234,60 @@ public class OryxOsRuntime {
   }
 
   @Bean
-  LlmCallAuditor llmCallAuditor(LlmCallRepository repository) {
-    return new JpaLlmCallAuditor(repository);
+  io.oryxos.core.cost.CostLedgerStore costLedgerStore(
+      io.oryxos.storage.CostLedgerEntryRepository repository) {
+    return new io.oryxos.storage.JpaCostLedgerStore(repository);
   }
 
   @Bean
-  ToolInvocationAuditor toolInvocationAuditor(ToolInvocationRepository repository) {
-    return new JpaToolInvocationAuditor(repository);
+  io.oryxos.core.cost.AuditLlmCostSource auditLlmCostSource(LlmCallRepository repository) {
+    return new io.oryxos.storage.JpaAuditLlmCostSource(repository);
+  }
+
+  @Bean
+  io.oryxos.core.cost.CostLedgerService costLedgerService(
+      io.oryxos.core.cost.CostProperties costProperties,
+      io.oryxos.core.cost.CostLedgerStore costLedgerStore,
+      io.oryxos.core.cost.AuditLlmCostSource auditLlmCostSource) {
+    return new io.oryxos.core.cost.CostLedgerService(
+        costProperties, costLedgerStore, auditLlmCostSource);
+  }
+
+  @Bean
+  io.oryxos.core.routing.RoutingDecisionStore routingDecisionStore(
+      io.oryxos.core.routing.RoutingProperties routingProperties) {
+    return new io.oryxos.core.routing.InMemoryRoutingDecisionStore(
+        routingProperties.getDecisionLogSize());
+  }
+
+  @Bean
+  io.oryxos.core.routing.ModelRoutingService modelRoutingService(
+      io.oryxos.core.routing.RoutingProperties routingProperties,
+      io.oryxos.core.routing.RoutingDecisionStore routingDecisionStore,
+      PricingStore pricingStore,
+      io.oryxos.core.cost.CostLedgerService costLedgerService) {
+    io.oryxos.core.routing.ModelRoutingService svc =
+        new io.oryxos.core.routing.ModelRoutingService(
+            routingProperties, routingDecisionStore, pricingStore);
+    svc.setCostLedgerService(costLedgerService);
+    return svc;
+  }
+
+  @Bean
+  LlmCallAuditor llmCallAuditor(
+      LlmCallRepository repository,
+      io.oryxos.core.cost.CostLedgerService costLedgerService,
+      PricingStore pricingStore) {
+    LlmCallAuditor jpa = new JpaLlmCallAuditor(repository);
+    return new io.oryxos.core.cost.CostAwareLlmCallAuditor(jpa, costLedgerService, pricingStore);
+  }
+
+  @Bean
+  ToolInvocationAuditor toolInvocationAuditor(
+      ToolInvocationRepository repository,
+      io.oryxos.core.cost.CostLedgerService costLedgerService) {
+    ToolInvocationAuditor jpa = new JpaToolInvocationAuditor(repository);
+    return new io.oryxos.core.cost.CostAwareToolInvocationAuditor(jpa, costLedgerService);
   }
 
   @Bean
@@ -272,7 +332,9 @@ public class OryxOsRuntime {
       LlmCallAuditor auditor,
       PricingStore pricingStore,
       io.oryxos.core.metrics.MetricsRecorder metricsRecorder,
-      io.oryxos.core.metrics.SpanRecorder spanRecorder) {
+      io.oryxos.core.metrics.SpanRecorder spanRecorder,
+      io.oryxos.core.cost.CostLedgerService costLedgerService,
+      io.oryxos.core.routing.ModelRoutingService modelRoutingService) {
     // 动态解析（31 节）：按名从注册表取参数、经工厂即时建/缓存 ChatModel（宪法 III 显式映射，只是运行时可变）
     ProviderChatModelFactory factory = new ProviderChatModelFactory();
     SpringAiProviderServiceImpl service =
@@ -284,6 +346,8 @@ public class OryxOsRuntime {
             pricingStore,
             metricsRecorder); // 023：LLM 调用/token/切换指标
     service.setSpanRecorder(spanRecorder); // 039：LLM span（未配 otel.endpoint 时为 NOOP）
+    service.setCostLedgerService(costLedgerService); // 050 / #476
+    service.setModelRoutingService(modelRoutingService); // 051 / #477
     return service;
   }
 
@@ -782,7 +846,8 @@ public class OryxOsRuntime {
     nullToEmpty(httpProps.allowedDomains()).forEach(d -> whitelist.add(Category.HTTP, d));
     nullToEmpty(smtpProps.allowedEndpoints()).forEach(e -> whitelist.add(Category.SMTP, e));
     // 工作区根永远是 Agent 的家：随 oryxos.root 自动纳入文件白名单（幂等 + 落库）。
-    whitelist.add(Category.FILE, oryxosRootProp);
+    whitelist.add(Category.FILE, workspaceStorage.root().toString());
+    whitelist.add(Category.FILE, nativeWorkspaceRoot().toString());
     return whitelist;
   }
 
@@ -850,7 +915,7 @@ public class OryxOsRuntime {
           new Mem0MemoryStore(
               restClient.mutate().baseUrl(mem0BaseUrl).build(), mem0UserId, mem0ApiKey);
       case "markdown" -> new MarkdownMemoryStore(oryxosRoot());
-        // 026 顺修：未知值曾静默回落 markdown——配置了却不生效比启动失败更危险（knowledge.store 同口径）
+      // 026 顺修：未知值曾静默回落 markdown——配置了却不生效比启动失败更危险（knowledge.store 同口径）
       default ->
           throw new IllegalStateException(
               "未知的 memory.backend: " + backend + "（支持 markdown / sqlite / mem0）");
@@ -956,7 +1021,8 @@ public class OryxOsRuntime {
       org.springframework.beans.factory.ObjectProvider<ProfileRegistry> profileRegistryProvider) {
     ToolRegistry registry = new ToolRegistry();
     // 内置工具走 @Tool 注解管道（schema 自动生成，宪法 II 第二件事）
-    registry.registerAnnotated(new FileTools(sandbox)); // read/write/list/edit/grep/glob
+    registry.registerAnnotated(
+        new FileTools(sandbox, workspaceStorage)); // read/write/list/edit/grep/glob
     // 024：执行后端按档位装配（local=现状零变化 / docker=短命容器），白名单 enforce 仍在工具内部前置（FR-007）；
     // US2：全局档为基线，frontmatter sandbox 段按 Agent 覆写（D8 收敛在 AgentAwareProcessStarter）。
     // ProfileRegistry 走 ObjectProvider 惰性解析——直接注入会成环：
@@ -975,11 +1041,12 @@ public class OryxOsRuntime {
             effective ->
                 new DockerProcessStarter(
                     effective,
-                    new WorkspacePathMapper(oryxosRoot()),
+                    new WorkspacePathMapper(nativeWorkspaceRoot()),
                     CidfileProcessWrapper.dockerCliKiller()));
-    registry.registerAnnotated(new ShellTools(sandbox, shellStarter));
+    registry.registerAnnotated(new ShellTools(sandbox, shellStarter, workspaceStorage));
     registry.registerAnnotated(
-        new HttpTools(sandbox, restClient)); // + http_request/fetch_webpage/download_file
+        new HttpTools(
+            sandbox, restClient, workspaceStorage)); // + http_request/fetch_webpage/download_file
     registry.registerAnnotated(new UtilTools()); // current_time / json_extract（纯计算，无沙箱）
     registry.registerAnnotated(
         new WebSearchTools(sandbox, new DuckDuckGoSearchProvider(restClient, sandbox)));
@@ -1046,6 +1113,126 @@ public class OryxOsRuntime {
   }
 
   /**
+   * 042 / #464: high-risk approval policy. Default {@code oryxos.approval.enabled=false} keeps
+   * evaluate() as ALLOW; audit goes to approval_events (NOOP when repo absent).
+   */
+  @Bean
+  io.oryxos.core.policy.ApprovalPolicyService approvalPolicyService(
+      io.oryxos.core.policy.ApprovalPolicyProperties properties,
+      ToolRegistry toolRegistry,
+      org.springframework.beans.factory.ObjectProvider<io.oryxos.core.policy.ApprovalAuditRecorder>
+          auditRecorder) {
+    java.util.function.Function<String, String> mcpLookup =
+        name -> toolRegistry.mcpToolOwners().get(name);
+    return new io.oryxos.core.policy.ConfigApprovalPolicyServiceImpl(
+        properties.toConfig(),
+        new io.oryxos.core.policy.HighRiskActionClassifier(mcpLookup),
+        mcpLookup,
+        auditRecorder.getIfAvailable(() -> io.oryxos.core.policy.ApprovalAuditRecorder.NOOP));
+  }
+
+  @Bean
+  io.oryxos.core.policy.ApprovalAuditRecorder approvalAuditRecorder(
+      org.springframework.beans.factory.ObjectProvider<io.oryxos.storage.ApprovalEventRepository>
+          repository) {
+    io.oryxos.storage.ApprovalEventRepository repo = repository.getIfAvailable();
+    if (repo == null) {
+      return io.oryxos.core.policy.ApprovalAuditRecorder.NOOP;
+    }
+    return new io.oryxos.storage.JpaApprovalAuditRecorder(repo);
+  }
+
+  /** 043 / #465：检查点存储；无 JPA 时进程内（测试/精简装配）。 */
+  @Bean
+  io.oryxos.core.durable.TaskCheckpointStore taskCheckpointStore(
+      org.springframework.beans.factory.ObjectProvider<
+              io.oryxos.storage.DurableTaskCheckpointRepository>
+          repository) {
+    io.oryxos.storage.DurableTaskCheckpointRepository repo = repository.getIfAvailable();
+    if (repo == null) {
+      return new io.oryxos.core.durable.InMemoryTaskCheckpointStore();
+    }
+    return new io.oryxos.storage.JpaTaskCheckpointStore(repo);
+  }
+
+  @Bean
+  io.oryxos.core.durable.DurableTaskService durableTaskService(
+      io.oryxos.core.durable.TaskCheckpointStore taskCheckpointStore,
+      io.oryxos.core.policy.ApprovalPolicyProperties approvalProperties,
+      io.oryxos.core.policy.ApprovalPolicyService approvalPolicyService) {
+    boolean enabled = approvalProperties.isEnabled() && approvalProperties.isDurableSuspend();
+    return new io.oryxos.core.durable.DurableTaskService(
+        taskCheckpointStore, java.time.Clock.systemUTC(), approvalPolicyService, enabled);
+  }
+
+  @Bean
+  io.oryxos.core.durable.DurableTaskReplay durableTaskReplay(
+      io.oryxos.core.durable.DurableTaskService durableTaskService, ToolExecutor toolExecutor) {
+    return new io.oryxos.core.durable.DurableTaskReplay(durableTaskService, toolExecutor);
+  }
+
+  /** 046 / #468：Flow run 存储；无 JPA 时进程内。 */
+  @Bean
+  io.oryxos.core.flow.FlowRunStore flowRunStore(
+      org.springframework.beans.factory.ObjectProvider<io.oryxos.storage.FlowRunRepository> runRepo,
+      org.springframework.beans.factory.ObjectProvider<io.oryxos.storage.FlowStepRepository>
+          stepRepo) {
+    io.oryxos.storage.FlowRunRepository runs = runRepo.getIfAvailable();
+    io.oryxos.storage.FlowStepRepository steps = stepRepo.getIfAvailable();
+    if (runs == null || steps == null) {
+      return new io.oryxos.core.flow.InMemoryFlowRunStore();
+    }
+    return new io.oryxos.storage.JpaFlowRunStore(runs, steps);
+  }
+
+  /** 046 / #468 + 047 / #469：Markdown Flow 执行引擎（engine/compensation 默认 false）。 */
+  @Bean
+  io.oryxos.core.flow.FlowEngine flowEngine(
+      io.oryxos.core.flow.FlowRunStore flowRunStore,
+      io.oryxos.core.flow.FlowEngineProperties flowProperties) {
+    return new io.oryxos.core.flow.FlowEngine(
+        flowRunStore,
+        new io.oryxos.core.flow.DefaultFlowNodeHandler(),
+        java.time.Clock.systemUTC(),
+        flowProperties.isEngineEnabled(),
+        flowProperties.getDefaultMaxRetries(),
+        flowProperties.isCompensationEnabled());
+  }
+
+  /** 044 / #466：IM 回调收据；无 JPA 时进程内。 */
+  @Bean
+  io.oryxos.core.durable.ApprovalCallbackReceiptStore approvalCallbackReceiptStore(
+      org.springframework.beans.factory.ObjectProvider<
+              io.oryxos.storage.ApprovalCallbackReceiptRepository>
+          repository) {
+    io.oryxos.storage.ApprovalCallbackReceiptRepository repo = repository.getIfAvailable();
+    if (repo == null) {
+      return new io.oryxos.core.durable.InMemoryApprovalCallbackReceiptStore();
+    }
+    return new io.oryxos.storage.JpaApprovalCallbackReceiptStore(repo);
+  }
+
+  /** 044 / #466：管理台/IM 审批交互门面（默认 interaction-api-enabled=false）。 */
+  @Bean
+  io.oryxos.core.durable.ApprovalInteractionService approvalInteractionService(
+      io.oryxos.core.durable.DurableTaskService durableTaskService,
+      io.oryxos.core.durable.DurableTaskReplay durableTaskReplay,
+      io.oryxos.core.durable.TaskCheckpointStore taskCheckpointStore,
+      io.oryxos.core.durable.ApprovalCallbackReceiptStore approvalCallbackReceiptStore,
+      io.oryxos.core.policy.ApprovalAuditRecorder approvalAuditRecorder,
+      io.oryxos.core.policy.ApprovalPolicyProperties approvalProperties) {
+    boolean enabled = approvalProperties.isInteractionApiEnabled();
+    return new io.oryxos.core.durable.ApprovalInteractionService(
+        durableTaskService,
+        durableTaskReplay,
+        taskCheckpointStore,
+        approvalCallbackReceiptStore,
+        approvalAuditRecorder,
+        java.time.Clock.systemUTC(),
+        enabled);
+  }
+
+  /**
    * 020：策略加载期告警（未知目标规则 / 有效集全空，WARN 不阻断）。仅 SERVLET 模式（serve/gateway）跑—— CLI 管理命令用
    * WebApplicationType.NONE，不受影响（镜像 018 ApiKeyStartupCheck 的条件口径）。
    */
@@ -1090,11 +1277,13 @@ public class OryxOsRuntime {
       ContextLoader contextLoader,
       Map<String, OryxTool> tools,
       MemoryService memoryService,
-      io.oryxos.core.policy.ToolPolicyService toolPolicyService) {
+      io.oryxos.core.policy.ToolPolicyService toolPolicyService,
+      io.oryxos.core.policy.ApprovalPolicyService approvalPolicyService) {
     // 22 节起：注入 MemoryService，长期记忆段由门面供给（会话历史段仍由 PromptBuilder 独立负责）
     PromptBuilder builder =
         new PromptBuilder(contextLoader, tools, memoryService, java.time.Clock.systemDefaultZone());
     builder.setToolPolicy(toolPolicyService); // 020：事前过滤——被 deny 工具不进模型清单
+    builder.setApprovalPolicy(approvalPolicyService); // 042: prompt visibility shares decide
     return builder;
   }
 
@@ -1106,6 +1295,10 @@ public class OryxOsRuntime {
       ToolInvocationAuditor auditor,
       AgentRunEventPublisher agentRunEventPublisher,
       io.oryxos.core.policy.ToolPolicyService toolPolicyService,
+      io.oryxos.core.policy.ApprovalPolicyService approvalPolicyService,
+      io.oryxos.core.durable.DurableTaskService durableTaskService,
+      org.springframework.beans.factory.ObjectProvider<io.oryxos.core.policy.AuthorizationService>
+          authorizationService,
       io.oryxos.core.metrics.MetricsRecorder metricsRecorder,
       io.oryxos.core.metrics.SpanRecorder spanRecorder) {
     // 31 节：mcp_servers 白名单在此接线。mcpToolOwners() 是活视图，与 tools bean 一样不能在构造时 copyOf。
@@ -1113,6 +1306,12 @@ public class OryxOsRuntime {
         new ToolExecutor(
             tools, toolRegistry.mcpToolOwners(), profileRegistry, auditor, agentRunEventPublisher);
     executor.setToolPolicy(toolPolicyService); // 020：事中裁决——防幻觉调用与热更新窗口
+    executor.setApprovalPolicy(approvalPolicyService); // 042: execution-side approval gate
+    executor.setDurableTaskService(durableTaskService); // 043: durable suspend
+    // 039/#527：web 装配注入同一 decide；纯 CLI 无 Bean 时 ALLOW_ALL
+    executor.setAuthorizationService(
+        authorizationService.getIfAvailable(
+            () -> io.oryxos.core.policy.AuthorizationService.ALLOW_ALL));
     executor.setMetricsRecorder(metricsRecorder); // 023：工具调用/策略拦截指标
     executor.setSpanRecorder(spanRecorder); // 039：工具 span（未配 otel.endpoint 时为 NOOP）
     return executor;
@@ -1171,6 +1370,31 @@ public class OryxOsRuntime {
     return new io.oryxos.storage.AssetGovernanceEventRecorder(repository);
   }
 
+  /** #537：治理全文快照（写失败不回滚侧车）。 */
+  @Bean
+  io.oryxos.storage.AssetGovernanceRevisionRecorder assetGovernanceRevisionRecorder(
+      io.oryxos.storage.AssetGovernanceRevisionRepository repository) {
+    return new io.oryxos.storage.AssetGovernanceRevisionRecorder(repository);
+  }
+
+  /** 049 / #473：共享内容版本指针（默认关；启用后与 VersionedAssetSource 配合）。 */
+  @Bean
+  io.oryxos.core.workspace.versioned.VersionedAssetPointerStore versionedAssetPointerStore(
+      io.oryxos.storage.WorkspaceAssetVersionRepository versions,
+      io.oryxos.storage.WorkspaceAssetActiveRepository active) {
+    return new io.oryxos.storage.JpaVersionedAssetPointerStore(versions, active);
+  }
+
+  /** 049 / #473：Agent/Skill/Knowledge 版本源（快照 + 原子切换/回滚）。 */
+  @Bean
+  io.oryxos.core.workspace.versioned.VersionedAssetSource versionedAssetSource(
+      io.oryxos.core.workspace.versioned.VersionedAssetPointerStore pointers,
+      io.oryxos.core.cluster.ClusterProperties clusterProperties,
+      io.oryxos.core.cluster.WorkspaceVersionNotifier workspaceVersionNotifier) {
+    return new io.oryxos.core.workspace.versioned.VersionedAssetSource(
+        oryxosRoot(), pointers, clusterProperties, workspaceVersionNotifier);
+  }
+
   /** 040：OIDC issuer/sub → 本地 username 映射。 */
   @Bean
   IdentityMappingService identityMappingService(
@@ -1178,6 +1402,37 @@ public class OryxOsRuntime {
       WebUserRepository userRepository,
       AuthEventRecorder authEventRecorder) {
     return new IdentityMappingService(repository, userRepository, authEventRecorder);
+  }
+
+  /** #535：持久化团队成员（CLI + Principal 合并）；注入 Principal 由 web 侧 flag 控制。 */
+  @Bean
+  io.oryxos.storage.TeamMembershipService teamMembershipService(
+      io.oryxos.storage.TeamMembershipRepository repository, WebUserRepository userRepository) {
+    return new io.oryxos.storage.TeamMembershipService(repository, userRepository);
+  }
+
+  /** #539 / #554 / #581：团队目录（展示名 + 可选 org_id / parent_team_id）；与成员表解耦，catalog 行可选。 */
+  @Bean
+  io.oryxos.storage.TeamCatalogService teamCatalogService(
+      io.oryxos.storage.TeamRepository repository,
+      io.oryxos.storage.OrganizationRepository organizationRepository,
+      @org.springframework.beans.factory.annotation.Value(
+              "${oryxos.web.asset-governance.max-org-ancestor-depth:16}")
+          int maxTeamAncestorDepth) {
+    return new io.oryxos.storage.TeamCatalogService(
+        repository, organizationRepository, maxTeamAncestorDepth);
+  }
+
+  /** #554：组织目录（展示名）；不驱动 AuthorizationService.decide。深度与 decide 祖先匹配共用配置。 */
+  @Bean
+  io.oryxos.storage.OrganizationCatalogService organizationCatalogService(
+      io.oryxos.storage.OrganizationRepository repository,
+      io.oryxos.storage.TeamRepository teamRepository,
+      @org.springframework.beans.factory.annotation.Value(
+              "${oryxos.web.asset-governance.max-org-ancestor-depth:16}")
+          int maxOrgAncestorDepth) {
+    return new io.oryxos.storage.OrganizationCatalogService(
+        repository, teamRepository, maxOrgAncestorDepth);
   }
 
   /**
@@ -1222,8 +1477,44 @@ public class OryxOsRuntime {
   }
 
   @Bean
-  CliChannel cliChannel(AgentService agentService, SessionManager sessionManager) {
-    return new CliChannel(agentService, sessionManager);
+  CliChannel cliChannel(
+      AgentService agentService,
+      SessionManager sessionManager,
+      org.springframework.core.env.Environment environment) {
+    CliChannel channel = new CliChannel(agentService, sessionManager);
+    // 039 / #533：角色取 default-user-roles（与管理台空默认档一致）；不反向依赖 oryxos-web
+    channel.setRunRoles(
+        parseRoleNames(bindStringList(environment, "oryxos.web.rbac.roles.default-user-roles")));
+    return channel;
+  }
+
+  private static java.util.List<String> bindStringList(
+      org.springframework.core.env.Environment environment, String property) {
+    return org.springframework.boot.context.properties.bind.Binder.get(environment)
+        .bind(
+            property,
+            org.springframework.boot.context.properties.bind.Bindable.listOf(String.class))
+        .orElse(java.util.List.of());
+  }
+
+  private static java.util.Set<io.oryxos.core.auth.Role> parseRoleNames(
+      java.util.List<String> raw) {
+    java.util.Set<io.oryxos.core.auth.Role> parsed = new java.util.LinkedHashSet<>();
+    if (raw == null) {
+      return parsed;
+    }
+    for (String name : raw) {
+      if (name == null || name.isBlank()) {
+        continue;
+      }
+      try {
+        parsed.add(
+            io.oryxos.core.auth.Role.valueOf(name.strip().toUpperCase(java.util.Locale.ROOT)));
+      } catch (IllegalArgumentException ignored) {
+        // 非法名忽略（与 AuthorizationConfig.parseRoles 同口径）
+      }
+    }
+    return parsed;
   }
 
   // ── 017：入站 IM 渠道（飞书长连接）────────────────────────────────────────
@@ -1261,7 +1552,13 @@ public class OryxOsRuntime {
       AgentExecutionService agentExecutionService,
       io.oryxos.core.channel.MessageDeduplicator messageDeduplicator,
       InterruptManager interruptManager,
-      io.oryxos.core.metrics.MetricsRecorder metricsRecorder) {
+      io.oryxos.core.metrics.MetricsRecorder metricsRecorder,
+      io.oryxos.core.policy.AssetGovernanceStore assetGovernanceStore,
+      @org.springframework.beans.factory.annotation.Value("${oryxos.web.rbac.enabled:false}")
+          boolean rbacEnabled,
+      @org.springframework.beans.factory.annotation.Value(
+              "${oryxos.web.asset-governance.enabled:false}")
+          boolean assetGovernanceEnabled) {
     return new io.oryxos.core.channel.InboundMessageService(
         agentService,
         sessionManager,
@@ -1271,7 +1568,9 @@ public class OryxOsRuntime {
         new io.oryxos.core.channel.DefaultInboundMediaEnricher(
             io.oryxos.cli.WhisperHttpTranscriber.fromEnv(), metricsRecorder),
         java.time.Duration.ofSeconds(15), // 「处理中」提示延迟（Edge Case：先行告知）
-        interruptManager);
+        interruptManager,
+        io.oryxos.core.policy.InboundAssetGovernanceGate.of(
+            assetGovernanceStore, rbacEnabled, assetGovernanceEnabled));
   }
 
   /** 渠道出站守卫：渠道自建 HTTP 不被沙箱自动拦截，经此显式复用 http 域名白名单（宪法 VI / 017 R7）。 */
